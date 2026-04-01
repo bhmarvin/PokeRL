@@ -33,32 +33,35 @@ POKE_ENV_REWARD_KEYS = (
 
 REWARD_CONFIG = {
     "fainted_value": 1.0,
-    "hp_value": 2.0,
+    "hp_value": 0.5,
     "status_value": 0.25,
-    "victory_value": 15.0,
-    "penalty_redundant_stealthrock": -2.0,
-    "penalty_redundant_stickyweb": -2.0,
-    "penalty_redundant_spikes": -2.0,
-    "penalty_redundant_status": -2.0,
-    "penalty_bad_encore": -2.0,
-    "penalty_ineffective_heal": -2.0,
-    "penalty_wasteful_heal_overflow": -1.0,
-    "penalty_redundant_self_drop_move": -1.0,
-    "penalty_unsafe_stay_in_with_fast_ko_switch": -0.75,
-    "bonus_good_heal_timing": 0.2,
-    "bonus_good_attack_selection": 0.15,
-    "bonus_good_safe_switch": 0.2,
+    "victory_value": 30.0,
+    "penalty_redundant_stealthrock": -1.0,
+    "penalty_redundant_stickyweb": -1.0,
+    "penalty_redundant_spikes": -1.0,
+    "penalty_redundant_status": -1.0,
+    "penalty_bad_encore": -1.0,
+    "penalty_ineffective_heal": -1.0,
+    "penalty_wasteful_heal_overflow": -0.5,
+    "penalty_redundant_self_drop_move": -0.5,
+    "penalty_unsafe_stay_in_with_fast_ko_switch": -0.5,
+    "bonus_good_heal_timing": 0.4,
+    "bonus_good_attack_selection": 0.0,
+    "bonus_good_safe_switch": 0.4,
+    "bonus_good_tera": 0.5,
 }
 
 DECISION_AUDIT_SAMPLE_LIMIT = 20
 
-VECTOR_LENGTH = 632
+VECTOR_LENGTH = 653
 MOVE_BLOCK_SIZE = 25
 MY_BENCH_SLOT_SIZE = 52
 OPP_BENCH_SLOT_SIZE = 20
 BENCH_MOVE_FLAG_SIZE = 8
 OPP_THREAT_ROWS = 4
 OPP_THREAT_ROW_SIZE = 8
+MY_ACTIVE_BLOCK_SIZE = 60
+OPP_ACTIVE_BLOCK_SIZE = 41
 
 TURN_INDEX = 0
 WEATHER_START = 1
@@ -67,14 +70,14 @@ TRICK_ROOM_INDEX = 9
 MY_SIDE_START = 10
 OPP_SIDE_START = 17
 MY_ACTIVE_START = 24
-OPP_ACTIVE_START = 64
-SPEED_ADVANTAGE_INDEX = 104
-MY_MOVES_START = 105
-MY_BENCH_START = 205
-OPP_BENCH_START = 465
-TARGETING_START = 565
-MY_TEAM_REVEALED_START = 585
-OPP_THREAT_START = 591
+OPP_ACTIVE_START = MY_ACTIVE_START + MY_ACTIVE_BLOCK_SIZE  # 84
+SPEED_ADVANTAGE_INDEX = OPP_ACTIVE_START + OPP_ACTIVE_BLOCK_SIZE  # 125
+MY_MOVES_START = SPEED_ADVANTAGE_INDEX + 1  # 126
+MY_BENCH_START = MY_MOVES_START + 4 * MOVE_BLOCK_SIZE  # 226
+OPP_BENCH_START = MY_BENCH_START + 5 * MY_BENCH_SLOT_SIZE  # 486
+TARGETING_START = OPP_BENCH_START + 5 * OPP_BENCH_SLOT_SIZE  # 586
+MY_TEAM_REVEALED_START = TARGETING_START + 20  # 606
+OPP_THREAT_START = MY_TEAM_REVEALED_START + 6  # 612
 OPP_MOVES_VS_ME_START = OPP_THREAT_START + 2
 OPP_THREAT_OHKO_START = OPP_THREAT_START + OPP_THREAT_ROWS * OPP_THREAT_ROW_SIZE
 OPP_THREAT_CONFIDENCE_START = OPP_THREAT_OHKO_START + 6
@@ -187,6 +190,46 @@ def _safe_hp_fraction(mon: Optional[Pokemon]) -> float:
     return _clamp01(float(getattr(mon, "current_hp_fraction", 0.0) or 0.0))
 
 
+def _effective_types(mon: Pokemon) -> tuple[PokemonType, ...]:
+    """Return the pokemon's effective types, accounting for terastallization.
+    Tera'd pokemon become mono-type (their tera type only)."""
+    if getattr(mon, "is_terastallized", False):
+        tera_type = getattr(mon, "tera_type", None) or getattr(mon, "type_1", None)
+        if tera_type is not None:
+            return (tera_type,)
+    return mon.types
+
+
+def _stab_multiplier(attacker: Pokemon, move_type: PokemonType) -> float:
+    """Return STAB multiplier accounting for tera mechanics.
+    Gen 9: tera'd pokemon get STAB from both original types AND tera type.
+    If tera type matches an original type, STAB is 2.0x (adaptability-like)."""
+    if getattr(attacker, "is_terastallized", False):
+        tera_type = getattr(attacker, "tera_type", None)
+        original_types = attacker.types  # .types returns base types
+        if tera_type is not None:
+            tera_stab = move_type == tera_type
+            original_stab = move_type in original_types
+            if tera_stab and original_stab:
+                return 2.0  # Adaptability-like bonus
+            if tera_stab or original_stab:
+                return 1.5
+            return 1.0
+    return 1.5 if move_type in attacker.types else 1.0
+
+
+def _defender_type_mult(
+    move_type: PokemonType,
+    defender: Pokemon,
+    type_chart: Any,
+) -> float:
+    """Type effectiveness accounting for tera (mono-type when tera'd)."""
+    if getattr(defender, "is_terastallized", False):
+        tera_type = getattr(defender, "tera_type", None) or defender.type_1
+        return move_type.damage_multiplier(tera_type, None, type_chart=type_chart)
+    return move_type.damage_multiplier(defender.type_1, defender.type_2, type_chart=type_chart)
+
+
 def _safe_identifier(mon: Optional[Pokemon], role: Optional[str]) -> Optional[str]:
     if mon is None or role is None:
         return None
@@ -266,6 +309,7 @@ class BrentObservationVectorBuilder:
             self._fill_side_conditions(vector, MY_SIDE_START, battle.side_conditions)
             self._fill_side_conditions(vector, OPP_SIDE_START, battle.opponent_side_conditions)
             self._fill_active_block(vector, MY_ACTIVE_START, battle.active_pokemon, battle.available_moves, battle)
+            self._fill_my_active_tera(vector, MY_ACTIVE_START, battle.active_pokemon, battle)
             self._fill_active_block(
                 vector,
                 OPP_ACTIVE_START,
@@ -273,6 +317,7 @@ class BrentObservationVectorBuilder:
                 tuple(battle.opponent_active_pokemon.moves.values()) if battle.opponent_active_pokemon else (),
                 battle,
             )
+            self._fill_opp_active_tera(vector, OPP_ACTIVE_START, battle.opponent_active_pokemon)
             vector[SPEED_ADVANTAGE_INDEX] = self._speed_advantage(battle)
             self._fill_available_move_blocks(vector, battle)
             self._fill_my_bench(vector, battle)
@@ -331,11 +376,12 @@ class BrentObservationVectorBuilder:
             battle.opponent_side_conditions,
             "opp_side",
         )
-        self._verify_active_block(issues, vector, MY_ACTIVE_START, battle.active_pokemon, "my_active")
+        self._verify_active_block(issues, vector, MY_ACTIVE_START, MY_ACTIVE_BLOCK_SIZE, battle.active_pokemon, "my_active")
         self._verify_active_block(
             issues,
             vector,
             OPP_ACTIVE_START,
+            OPP_ACTIVE_BLOCK_SIZE,
             battle.opponent_active_pokemon,
             "opp_active",
         )
@@ -395,7 +441,7 @@ class BrentObservationVectorBuilder:
             return
 
         vector[start] = _safe_hp_fraction(mon)
-        self._fill_type_one_hot(vector, start + 1, mon.types)
+        self._fill_type_one_hot(vector, start + 1, _effective_types(mon))
 
         for offset, stat in enumerate(BOOST_ORDER):
             vector[start + 19 + offset] = _clamp(float(mon.boosts.get(stat, 0)) / 6.0, -1.0, 1.0)
@@ -410,6 +456,37 @@ class BrentObservationVectorBuilder:
         item_flags = self._item_capabilities(mon, moves, battle)
         for offset, value in enumerate(item_flags):
             vector[start + 35 + offset] = value
+
+    def _fill_my_active_tera(
+        self,
+        vector: np.ndarray,
+        start: int,
+        mon: Optional[Pokemon],
+        battle: AbstractBattle,
+    ) -> None:
+        """Fill tera features for my active pokemon (offsets 40-59 within my active block).
+        Layout: is_terastallized(1) + can_tera(1) + tera_type_one_hot(18) = 20 features."""
+        if mon is None:
+            return
+        vector[start + 40] = 1.0 if getattr(mon, "is_terastallized", False) else 0.0
+        vector[start + 41] = 1.0 if getattr(battle, "can_tera", False) else 0.0
+        tera_type = getattr(mon, "tera_type", None)
+        if tera_type is not None:
+            for offset, poke_type in enumerate(TYPE_ORDER):
+                vector[start + 42 + offset] = 1.0 if poke_type == tera_type else 0.0
+
+    def _fill_opp_active_tera(
+        self,
+        vector: np.ndarray,
+        start: int,
+        mon: Optional[Pokemon],
+    ) -> None:
+        """Fill tera features for opponent active pokemon (offset 40 within opp active block).
+        Layout: is_terastallized(1) = 1 feature.
+        Opponent tera type is already reflected in the type one-hot via _effective_types."""
+        if mon is None:
+            return
+        vector[start + 40] = 1.0 if getattr(mon, "is_terastallized", False) else 0.0
 
     def _fill_type_one_hot(
         self,
@@ -459,18 +536,19 @@ class BrentObservationVectorBuilder:
         issues: list[str],
         vector: np.ndarray,
         start: int,
+        block_size: int,
         mon: Optional[Pokemon],
         prefix: str,
     ) -> None:
         if mon is None:
-            expected = np.zeros(40, dtype=np.float32)
-            observed = vector[start : start + 40]
+            expected = np.zeros(block_size, dtype=np.float32)
+            observed = vector[start : start + block_size]
             if not np.allclose(observed, expected):
                 issues.append(f"{prefix} expected zero block when pokemon is None")
             return
 
         self._verify_scalar(issues, f"{prefix}.hp", vector[start], _safe_hp_fraction(mon))
-        type_set = set(mon.types)
+        type_set = set(_effective_types(mon))
         for offset, poke_type in enumerate(TYPE_ORDER):
             self._verify_scalar(
                 issues,
@@ -1165,8 +1243,8 @@ class BrentObservationVectorBuilder:
         
         # Modifiers
         move_type = self._resolve_move_type(attacker, move, battle)
-        type_mult = move_type.damage_multiplier(defender.type_1, defender.type_2, type_chart=self._gen_data.type_chart)
-        stab = 1.5 if move_type in attacker.types else 1.0
+        type_mult = _defender_type_mult(move_type, defender, self._gen_data.type_chart)
+        stab = _stab_multiplier(attacker, move_type)
         
         # Weather/Burn
         weather_mult = 1.0
@@ -1198,11 +1276,7 @@ class BrentObservationVectorBuilder:
             return None
 
         move_type = self._resolve_move_type(attacker, move, battle)
-        type_mult = move_type.damage_multiplier(
-            defender.type_1,
-            defender.type_2,
-            type_chart=self._gen_data.type_chart,
-        )
+        type_mult = _defender_type_mult(move_type, defender, self._gen_data.type_chart)
         if type_mult == 0.0:
             return 0.0
 
@@ -1236,7 +1310,7 @@ class BrentObservationVectorBuilder:
 
     def _is_stab(self, attacker: Pokemon, move: Move, battle: AbstractBattle) -> float:
         move_type = self._resolve_move_type(attacker, move, battle)
-        return 1.0 if move_type in attacker.types else 0.0
+        return 1.0 if _stab_multiplier(attacker, move_type) > 1.0 else 0.0
 
     def _resolve_move_type(
         self,
@@ -1690,7 +1764,16 @@ class BrentsRLAgent(SinglesEnv):
     ) -> list[TacticalLeverMatch]:
         action = getattr(order, "order", None)
         if isinstance(action, Move):
-            return self._evaluate_move_tactical_levers(battle, action)
+            matches = self._evaluate_move_tactical_levers(battle, action)
+            if getattr(order, "terastallize", False):
+                tera_match = self._make_tactical_match(
+                    "good_tera",
+                    "bonus_good_tera",
+                    self._evaluate_good_tera(battle, action),
+                )
+                if tera_match is not None:
+                    matches.append(tera_match)
+            return matches
         if isinstance(action, Pokemon):
             return self._evaluate_switch_tactical_levers(battle, action)
         return []
@@ -1806,6 +1889,69 @@ class BrentsRLAgent(SinglesEnv):
             self._evaluate_good_safe_switch(battle, switch_target),
         )
         return [match] if match is not None else []
+
+    def _evaluate_good_tera(
+        self,
+        battle: AbstractBattle,
+        move: Move,
+    ) -> Optional[Dict[str, Any]]:
+        """Reward terastallizing when it gains a defensive immunity to the
+        opponent's last move, or when tera enables a KO that wouldn't happen
+        without it (tera STAB pushes damage past remaining HP)."""
+        active = battle.active_pokemon
+        opponent = battle.opponent_active_pokemon
+        if active is None or opponent is None:
+            return None
+
+        tera_type = getattr(active, "tera_type", None)
+        if tera_type is None:
+            return None
+
+        # Check defensive immunity: tera type is immune to opponent's last move type
+        opp_last_move = opponent.last_move if hasattr(opponent, "last_move") else None
+        gains_immunity = False
+        if opp_last_move is not None:
+            opp_move_type = getattr(opp_last_move, "type", None)
+            if opp_move_type is not None:
+                pre_tera_mult = opp_move_type.damage_multiplier(
+                    active.type_1, active.type_2,
+                    type_chart=self.vector_builder._gen_data.type_chart,
+                )
+                post_tera_mult = opp_move_type.damage_multiplier(
+                    tera_type, None,
+                    type_chart=self.vector_builder._gen_data.type_chart,
+                )
+                gains_immunity = pre_tera_mult > 0.0 and post_tera_mult == 0.0
+
+        # Check offensive: tera enables a KO that wouldn't happen without it
+        enables_ko = False
+        move_type = self.vector_builder._resolve_move_type(active, move, battle)
+        if move_type == tera_type and move.base_power and move.base_power > 0:
+            opp_hp = _safe_hp_fraction(opponent)
+            if opp_hp > 0.0:
+                # Compute STAB without tera vs with tera
+                pre_stab = 1.5 if move_type in active.types else 1.0
+                post_stab = _stab_multiplier(active, move_type)
+                if post_stab > pre_stab:
+                    # Get base damage range (uses pre-tera STAB internally)
+                    try:
+                        _, max_pct = self.vector_builder._damage_range_percent(
+                            battle, active, opponent, move, None, None,
+                        )
+                        # Scale max_pct by the STAB upgrade ratio
+                        boosted_max_pct = max_pct * (post_stab / pre_stab) if pre_stab > 0 else max_pct
+                        # Tera enables KO: without tera can't KO, with tera can
+                        enables_ko = max_pct < opp_hp and boosted_max_pct >= opp_hp
+                    except Exception:
+                        pass
+
+        if gains_immunity or enables_ko:
+            return {
+                "tera_type": str(tera_type),
+                "gains_immunity": gains_immunity,
+                "enables_ko": enables_ko,
+            }
+        return None
 
     def _move_has_status(self, move: Move) -> bool:
         try:
@@ -2249,10 +2395,8 @@ class BrentsRLAgent(SinglesEnv):
     ) -> bool:
         for entry in threat_entries:
             move_type = self.vector_builder._resolve_move_type(attacker, entry.move, battle)
-            type_mult = move_type.damage_multiplier(
-                defender.type_1,
-                defender.type_2,
-                type_chart=self.vector_builder._gen_data.type_chart,
+            type_mult = _defender_type_mult(
+                move_type, defender, self.vector_builder._gen_data.type_chart,
             )
             if type_mult > 0.5:
                 return False

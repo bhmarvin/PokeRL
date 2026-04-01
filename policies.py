@@ -12,9 +12,26 @@ from brent_agent import VECTOR_LENGTH
 class ObservationExtractor(BaseFeaturesExtractor):
     def __init__(self, observation_space: Any):
         super().__init__(observation_space, features_dim=VECTOR_LENGTH)
+        self.register_buffer("running_mean", th.zeros(VECTOR_LENGTH))
+        self.register_buffer("running_var", th.ones(VECTOR_LENGTH))
+        self.register_buffer("count", th.tensor(1e-4))
 
     def forward(self, obs: dict[str, th.Tensor]) -> th.Tensor:
-        return obs["observation"]
+        x = obs["observation"]
+        if self.training:
+            batch_mean = x.mean(dim=0)
+            batch_var = x.var(dim=0, unbiased=False)
+            batch_count = x.shape[0]
+            delta = batch_mean - self.running_mean
+            total = self.count + batch_count
+            self.running_mean += delta * batch_count / total
+            m_a = self.running_var * self.count
+            m_b = batch_var * batch_count
+            m2 = m_a + m_b + delta**2 * self.count * batch_count / total
+            self.running_var = m2 / total
+            self.count = total
+        std = (self.running_var + 1e-8).sqrt()
+        return ((x - self.running_mean) / std).clamp(-10.0, 10.0)
 
 
 class MaskedActorCriticPolicy(ActorCriticPolicy):
