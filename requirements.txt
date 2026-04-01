@@ -1,0 +1,5 @@
+numpy==2.4.4
+gymnasium==1.2.3
+poke-env==0.13.0
+stable-baselines3==2.7.1
+torch==2.11.0
