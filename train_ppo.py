@@ -344,8 +344,8 @@ def build_model(args: argparse.Namespace, env: Monitor) -> PPO:
         MaskedActorCriticPolicy,
         env,
         learning_rate=3e-4,
-        n_steps=512,
-        batch_size=64,
+        n_steps=2048,
+        batch_size=128,
         gamma=0.99,
         ent_coef=0.02,
         device=args.device,
@@ -364,6 +364,8 @@ def main() -> None:
         run_name=run_name,
         checkpoint_path=args.checkpoint_path,
     )
+
+    print(f"REWARD_CONFIG: {REWARD_CONFIG}")
 
     env = create_wrapped_env(args, args.train_opponent)
     env.reset(seed=args.seed)
