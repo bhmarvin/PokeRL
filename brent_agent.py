@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, Optional, Sequence, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 from gymnasium.spaces import Box
@@ -16,21 +17,48 @@ from poke_env.battle.status import Status
 from poke_env.battle.weather import Weather
 from poke_env.calc import calculate_damage
 from poke_env.calc.damage_calc_gen9 import get_item_boost_type
+from poke_env.data import GenData
 from poke_env.environment.singles_env import SinglesEnv
+from poke_env.player.battle_order import BattleOrder
 from poke_env.ps_client import AccountConfiguration
+
+from randbats_data import RandbatsMeta
+
+POKE_ENV_REWARD_KEYS = (
+    "fainted_value",
+    "hp_value",
+    "status_value",
+    "victory_value",
+)
 
 REWARD_CONFIG = {
     "fainted_value": 1.0,
-    "hp_value": 1.0,
+    "hp_value": 2.0,
     "status_value": 0.25,
-    "victory_value": 10.0,
+    "victory_value": 15.0,
+    "penalty_redundant_stealthrock": -2.0,
+    "penalty_redundant_stickyweb": -2.0,
+    "penalty_redundant_spikes": -2.0,
+    "penalty_redundant_status": -2.0,
+    "penalty_bad_encore": -2.0,
+    "penalty_ineffective_heal": -2.0,
+    "penalty_wasteful_heal_overflow": -1.0,
+    "penalty_redundant_self_drop_move": -1.0,
+    "penalty_unsafe_stay_in_with_fast_ko_switch": -0.75,
+    "bonus_good_heal_timing": 0.2,
+    "bonus_good_attack_selection": 0.15,
+    "bonus_good_safe_switch": 0.2,
 }
 
-VECTOR_LENGTH = 572
-MOVE_BLOCK_SIZE = 14
+DECISION_AUDIT_SAMPLE_LIMIT = 20
+
+VECTOR_LENGTH = 632
+MOVE_BLOCK_SIZE = 25
 MY_BENCH_SLOT_SIZE = 52
 OPP_BENCH_SLOT_SIZE = 20
 BENCH_MOVE_FLAG_SIZE = 8
+OPP_THREAT_ROWS = 4
+OPP_THREAT_ROW_SIZE = 8
 
 TURN_INDEX = 0
 WEATHER_START = 1
@@ -42,12 +70,15 @@ MY_ACTIVE_START = 24
 OPP_ACTIVE_START = 64
 SPEED_ADVANTAGE_INDEX = 104
 MY_MOVES_START = 105
-MY_BENCH_START = 161
-OPP_BENCH_START = 421
-TARGETING_START = 521
-MY_TEAM_REVEALED_START = 541
-OPP_MOVES_VS_ME_START = 547
-ON_RECHARGE_INDEX = 571
+MY_BENCH_START = 205
+OPP_BENCH_START = 465
+TARGETING_START = 565
+MY_TEAM_REVEALED_START = 585
+OPP_THREAT_START = 591
+OPP_MOVES_VS_ME_START = OPP_THREAT_START + 2
+OPP_THREAT_OHKO_START = OPP_THREAT_START + OPP_THREAT_ROWS * OPP_THREAT_ROW_SIZE
+OPP_THREAT_CONFIDENCE_START = OPP_THREAT_OHKO_START + 6
+ON_RECHARGE_INDEX = OPP_THREAT_CONFIDENCE_START + 2
 
 TYPE_ORDER = (
     PokemonType.BUG,
@@ -183,12 +214,47 @@ def _poison_severity(status: Optional[Status]) -> float:
     return 0.0
 
 
+@dataclass(frozen=True)
+class OpponentThreatEntry:
+    move: Move
+    move_prob: float
+    revealed_flag: float
+
+
+@dataclass(frozen=True)
+class ThreatAssessment:
+    posterior: Dict[str, float]
+    threat_entries: Tuple[OpponentThreatEntry, ...]
+    active_max_threat: float
+    active_ohko_risk: float
+    active_speed: float | None
+    opponent_speed: float | None
+
+
+@dataclass(frozen=True)
+class TacticalLeverMatch:
+    reason: str
+    reward: float
+    details: Dict[str, Any]
+    record_audit: bool = False
+
+
+@dataclass
+class TacticalRewardContext:
+    battle_tag: str
+    action: Move | Pokemon | None
+    matches: Tuple[TacticalLeverMatch, ...]
+
+
 class BrentObservationVectorBuilder:
     def __init__(self) -> None:
         self._my_team_revealed_memory: Dict[str, set[str]] = {}
         self._damage_cache: Dict[Tuple[str, str, str], Tuple[float, float]] = {}
         self._fallback_counts: Dict[Tuple[str, str, str], int] = {}
         self._fallback_samples: list[Dict[str, Any]] = []
+        self._inferred_move_cache: Dict[str, Optional[Move]] = {}
+        self._meta = RandbatsMeta()
+        self._gen_data = GenData.from_gen(9)
 
     def embed_battle(self, battle: AbstractBattle) -> np.ndarray:
         self._damage_cache = {}
@@ -212,7 +278,7 @@ class BrentObservationVectorBuilder:
             self._fill_my_bench(vector, battle)
             self._fill_opponent_bench(vector, battle)
             self._fill_targeting_matrix(vector, battle)
-            self._fill_theory_of_mind(vector, battle)
+            self._fill_opponent_threat_features(vector, battle)
             vector[ON_RECHARGE_INDEX] = self._on_recharge(battle.active_pokemon)
             return vector
         finally:
@@ -286,7 +352,7 @@ class BrentObservationVectorBuilder:
             self._on_recharge(battle.active_pokemon),
         )
         self._verify_opponent_bench_leaks(issues, vector, battle)
-        self._verify_theory_of_mind_leaks(issues, vector, battle)
+        self._verify_opponent_threat_ranges(issues, vector, battle)
         return issues
 
     def _update_reveal_memory(self, battle: AbstractBattle) -> None:
@@ -455,18 +521,47 @@ class BrentObservationVectorBuilder:
                 if not np.allclose(slot_vec, 0.0):
                     issues.append(f"opp_bench[{slot}] leaked hidden information")
 
-    def _verify_theory_of_mind_leaks(
+    def _verify_opponent_threat_ranges(
         self,
         issues: list[str],
         vector: np.ndarray,
         battle: AbstractBattle,
     ) -> None:
         opponent = battle.opponent_active_pokemon
-        revealed_count = len(tuple(opponent.moves.values())[:4]) if opponent is not None else 0
-        for move_idx in range(revealed_count, 4):
-            start = OPP_MOVES_VS_ME_START + move_idx * 6
-            if not np.allclose(vector[start : start + 6], 0.0):
-                issues.append(f"theory_of_mind row {move_idx} leaked unrevealed opponent move data")
+        if opponent is None:
+            if not np.allclose(vector[OPP_THREAT_START:ON_RECHARGE_INDEX], 0.0):
+                issues.append("opponent threat block should be zero with no opposing active pokemon")
+            return
+        for move_idx in range(OPP_THREAT_ROWS):
+            start = OPP_THREAT_START + move_idx * OPP_THREAT_ROW_SIZE
+            self._verify_unit_interval(issues, f"opp_threat[{move_idx}].move_prob", vector[start])
+            self._verify_unit_interval(issues, f"opp_threat[{move_idx}].revealed", vector[start + 1])
+            for target_idx in range(6):
+                self._verify_unit_interval(
+                    issues,
+                    f"opp_threat[{move_idx}].ev_vs_target[{target_idx}]",
+                    vector[start + 2 + target_idx],
+                )
+        for target_idx in range(6):
+            self._verify_unit_interval(
+                issues,
+                f"opp_threat.ohko_risk[{target_idx}]",
+                vector[OPP_THREAT_OHKO_START + target_idx],
+            )
+        self._verify_unit_interval(
+            issues,
+            "opp_threat.top_role_mass",
+            vector[OPP_THREAT_CONFIDENCE_START],
+        )
+        self._verify_unit_interval(
+            issues,
+            "opp_threat.role_entropy_norm",
+            vector[OPP_THREAT_CONFIDENCE_START + 1],
+        )
+
+    def _verify_unit_interval(self, issues: list[str], name: str, value: float) -> None:
+        if not np.isfinite(value) or value < -1e-6 or value > 1.0 + 1e-6:
+            issues.append(f"{name} should be in [0, 1], got {value}")
 
     def _item_capabilities(
         self,
@@ -549,8 +644,24 @@ class BrentObservationVectorBuilder:
         vector[start + 9] = 1.0 if "sound" in flags else 0.0
         vector[start + 10] = 1.0 if priority > 0 else 0.0
         vector[start + 11] = 1.0 if self._is_pivot(move) else 0.0
-        vector[start + 12] = _clamp01(self._move_heal_amount(move, battle))
+        vector[start + 12] = _clamp01(self._effective_move_heal_amount(move, attacker, battle))
         vector[start + 13] = _clamp01(self._move_drain(move))
+        vector[start + 14] = self._move_self_delta(move, "atk")
+        vector[start + 15] = self._move_self_delta(move, "spa")
+        vector[start + 16] = self._move_self_delta(move, "spe")
+        vector[start + 17] = self._estimated_recoil_fraction(
+            attacker,
+            defender,
+            move,
+            expected_value,
+        )
+        vector[start + 18] = self._move_causes_recharge(move)
+        vector[start + 19] = self._move_effect_chance(move, statuses=(Status.BRN,))
+        vector[start + 20] = self._move_effect_chance(move, statuses=(Status.PAR,))
+        vector[start + 21] = self._move_effect_chance(move, statuses=(Status.PSN, Status.TOX))
+        vector[start + 22] = self._move_effect_chance(move, statuses=(Status.FRZ,))
+        vector[start + 23] = self._move_effect_chance(move, statuses=(Status.SLP,))
+        vector[start + 24] = self._move_effect_chance(move, volatile_effect=Effect.CONFUSION)
 
     def _fill_my_bench(self, vector: np.ndarray, battle: AbstractBattle) -> None:
         bench = [mon for mon in battle.team.values() if not mon.active][:5]
@@ -579,7 +690,7 @@ class BrentObservationVectorBuilder:
         vector[start + 3] = 1.0 if "sound" in flags else 0.0
         vector[start + 4] = 1.0 if priority > 0 else 0.0
         vector[start + 5] = 1.0 if self._is_pivot(move) else 0.0
-        vector[start + 6] = _clamp01(self._move_heal_amount(move, battle))
+        vector[start + 6] = _clamp01(self._effective_move_heal_amount(move, None, battle))
         vector[start + 7] = _clamp01(self._move_drain(move))
 
     def _fill_opponent_bench(self, vector: np.ndarray, battle: AbstractBattle) -> None:
@@ -614,7 +725,7 @@ class BrentObservationVectorBuilder:
                 ev = _clamp01(((min_pct + max_pct) / 2.0) * _clamp01(float(move.accuracy)))
                 vector[TARGETING_START + move_idx * 5 + target_idx] = ev
 
-    def _fill_theory_of_mind(self, vector: np.ndarray, battle: AbstractBattle) -> None:
+    def _fill_opponent_threat_features(self, vector: np.ndarray, battle: AbstractBattle) -> None:
         my_team_order = self._my_team_order(battle)
         memory = self._my_team_revealed_memory.get(_battle_tag(battle), set())
         for idx, mon in enumerate(my_team_order):
@@ -626,21 +737,184 @@ class BrentObservationVectorBuilder:
         if opponent is None:
             return
 
-        revealed_moves = tuple(opponent.moves.values())[:4]
-        for move_idx, move in enumerate(revealed_moves):
+        posterior = self._opponent_role_posterior(opponent)
+        threat_entries = self._select_opponent_threat_entries(opponent, posterior)
+        for move_idx, entry in enumerate(threat_entries):
+            row_start = OPP_THREAT_START + move_idx * OPP_THREAT_ROW_SIZE
+            vector[row_start] = entry.move_prob
+            vector[row_start + 1] = entry.revealed_flag
             for target_idx, target in enumerate(my_team_order):
                 if target is None:
                     continue
-                min_pct, max_pct = self._damage_range_percent(
+                vector[row_start + 2 + target_idx] = self._move_expected_value(
+                    battle,
+                    opponent,
+                    target,
+                    entry.move,
+                    battle.opponent_role,
+                    battle.player_role,
+                )
+        for target_idx, target in enumerate(my_team_order):
+            if target is None:
+                continue
+            vector[OPP_THREAT_OHKO_START + target_idx] = self._estimate_ohko_risk(
+                battle,
+                opponent,
+                target,
+                posterior,
+            )
+        top_role_mass, role_entropy_norm = self._role_posterior_summary(posterior)
+        vector[OPP_THREAT_CONFIDENCE_START] = top_role_mass
+        vector[OPP_THREAT_CONFIDENCE_START + 1] = role_entropy_norm
+
+    def _opponent_role_posterior(self, opponent: Pokemon) -> Dict[str, float]:
+        revealed_moves = list(opponent.moves.keys())
+        posterior = self._meta.filter_roles(opponent.species, revealed_moves, opponent.item)
+        if posterior:
+            return posterior
+        posterior = self._meta.filter_roles(opponent.species, revealed_moves, None)
+        if posterior:
+            return posterior
+        return self._meta.filter_roles(opponent.species, [], None)
+
+    def _select_opponent_threat_entries(
+        self,
+        opponent: Pokemon,
+        posterior: Dict[str, float],
+    ) -> List[OpponentThreatEntry]:
+        entries: Dict[str, OpponentThreatEntry] = {}
+        for move in tuple(opponent.moves.values())[:OPP_THREAT_ROWS]:
+            entries[move.id] = OpponentThreatEntry(
+                move=move,
+                move_prob=1.0,
+                revealed_flag=1.0,
+            )
+        for move_id, move_prob in self._meta.get_move_marginals(opponent.species, posterior).items():
+            if move_id in entries:
+                continue
+            inferred_move = self._get_inferred_move(move_id)
+            if inferred_move is None:
+                continue
+            entries[move_id] = OpponentThreatEntry(
+                move=inferred_move,
+                move_prob=_clamp01(move_prob),
+                revealed_flag=0.0,
+            )
+        return sorted(
+            entries.values(),
+            key=lambda entry: (-entry.move_prob, -entry.revealed_flag, entry.move.id),
+        )[:OPP_THREAT_ROWS]
+
+    def _get_inferred_move(self, move_id: str) -> Optional[Move]:
+        cached_move = self._inferred_move_cache.get(move_id, None)
+        if move_id in self._inferred_move_cache:
+            return cached_move
+        try:
+            inferred_move = Move(move_id, gen=9)
+        except Exception:
+            inferred_move = None
+        self._inferred_move_cache[move_id] = inferred_move
+        return inferred_move
+
+    def _move_expected_value(
+        self,
+        battle: AbstractBattle,
+        attacker: Pokemon,
+        defender: Pokemon,
+        move: Move,
+        attacker_role: Optional[str],
+        defender_role: Optional[str],
+    ) -> float:
+        min_pct, max_pct = self._damage_range_percent(
+            battle,
+            attacker,
+            defender,
+            move,
+            attacker_role,
+            defender_role,
+        )
+        return _clamp01(((min_pct + max_pct) / 2.0) * _clamp01(float(move.accuracy)))
+
+    def _estimate_ohko_risk(
+        self,
+        battle: AbstractBattle,
+        opponent: Pokemon,
+        target: Pokemon,
+        posterior: Dict[str, float],
+    ) -> float:
+        target_hp = _safe_hp_fraction(target)
+        if target_hp <= 0.0:
+            return 0.0
+        revealed_moves = {move.id: move for move in tuple(opponent.moves.values())[:OPP_THREAT_ROWS]}
+        if not posterior:
+            return 1.0 if any(
+                self._move_has_ohko_roll(
                     battle,
                     opponent,
                     target,
                     move,
                     battle.opponent_role,
                     battle.player_role,
+                    target_hp,
                 )
-                ev = _clamp01(((min_pct + max_pct) / 2.0) * _clamp01(float(move.accuracy)))
-                vector[OPP_MOVES_VS_ME_START + move_idx * 6 + target_idx] = ev
+                for move in revealed_moves.values()
+            ) else 0.0
+
+        total_risk = 0.0
+        for role_name, role_weight in posterior.items():
+            role_risk = 0.0
+            role_moves = self._meta.get_role_move_distribution(opponent.species, role_name)
+            for move_id, move_prob in role_moves.items():
+                move = revealed_moves.get(move_id) or self._get_inferred_move(move_id)
+                if move is None:
+                    continue
+                if self._move_has_ohko_roll(
+                    battle,
+                    opponent,
+                    target,
+                    move,
+                    battle.opponent_role,
+                    battle.player_role,
+                    target_hp,
+                ):
+                    adjusted_prob = 1.0 if move_id in revealed_moves else float(move_prob)
+                    role_risk += adjusted_prob
+            total_risk += float(role_weight) * _clamp01(role_risk)
+        return _clamp01(total_risk)
+
+    def _move_has_ohko_roll(
+        self,
+        battle: AbstractBattle,
+        attacker: Pokemon,
+        defender: Pokemon,
+        move: Move,
+        attacker_role: Optional[str],
+        defender_role: Optional[str],
+        target_hp: Optional[float] = None,
+    ) -> bool:
+        _, max_pct = self._damage_range_percent(
+            battle,
+            attacker,
+            defender,
+            move,
+            attacker_role,
+            defender_role,
+        )
+        remaining_hp = _safe_hp_fraction(defender) if target_hp is None else target_hp
+        return remaining_hp > 0.0 and max_pct >= remaining_hp
+
+    def _role_posterior_summary(self, posterior: Dict[str, float]) -> Tuple[float, float]:
+        if not posterior:
+            return 0.0, 1.0
+        probabilities = np.asarray(list(posterior.values()), dtype=np.float32)
+        top_role_mass = float(np.max(probabilities))
+        if probabilities.size <= 1:
+            return top_role_mass, 0.0
+        entropy = float(-np.sum(probabilities * np.log(np.maximum(probabilities, 1e-12))))
+        max_entropy = float(np.log(float(probabilities.size)))
+        if max_entropy <= 0.0:
+            return top_role_mass, 0.0
+        return top_role_mass, _clamp01(entropy / max_entropy)
 
     def _my_team_order(self, battle: AbstractBattle) -> Tuple[Optional[Pokemon], ...]:
         bench = [mon for mon in battle.team.values() if not mon.active][:5]
@@ -652,9 +926,15 @@ class BrentObservationVectorBuilder:
 
     def _speed_advantage(self, battle: AbstractBattle) -> float:
         my_speed = self._effective_speed(battle.active_pokemon, battle.side_conditions)
+        opp_posterior = (
+            self._opponent_role_posterior(battle.opponent_active_pokemon)
+            if battle.opponent_active_pokemon is not None
+            else None
+        )
         opp_speed = self._effective_speed(
             battle.opponent_active_pokemon,
             battle.opponent_side_conditions,
+            role_posterior=opp_posterior,
         )
         if my_speed is None or opp_speed is None:
             return 0.0
@@ -668,11 +948,12 @@ class BrentObservationVectorBuilder:
         self,
         mon: Optional[Pokemon],
         side_conditions: Dict[SideCondition, int],
+        role_posterior: Optional[Dict[str, float]] = None,
     ) -> Optional[float]:
         if mon is None:
             return None
-        base_speed = mon.stats.get("spe")
-        if not isinstance(base_speed, (int, float)):
+        base_speed = self._speed_stat_estimate(mon, role_posterior)
+        if base_speed is None:
             return None
 
         speed = float(base_speed) * _stat_stage_multiplier(mon.boosts.get("spe", 0))
@@ -681,13 +962,84 @@ class BrentObservationVectorBuilder:
             speed *= 0.5
         if SideCondition.TAILWIND in side_conditions:
             speed *= 2.0
-        if mon.item in SPEED_BOOST_ITEMS:
-            speed *= 1.5
-        if mon.item in SPEED_DROP_ITEMS:
-            speed *= 0.5
+        speed *= self._speed_item_multiplier(mon, role_posterior)
         if Effect.QUARKDRIVESPE in mon.effects or Effect.PROTOSYNTHESISSPE in mon.effects:
             speed *= 1.5
         return speed
+
+    def _speed_stat_estimate(
+        self,
+        mon: Pokemon,
+        role_posterior: Optional[Dict[str, float]] = None,
+    ) -> Optional[float]:
+        stats = getattr(mon, "stats", {}) or {}
+        live_speed = stats.get("spe")
+        if isinstance(live_speed, (int, float)):
+            return float(live_speed)
+        if not role_posterior:
+            return None
+
+        species = getattr(mon, "species", None)
+        if not species:
+            return None
+        base_stats = getattr(mon, "base_stats", None) or stats
+        if not isinstance(base_stats, dict):
+            return None
+
+        weighted_speed = 0.0
+        total_weight = 0.0
+        for role_name, role_weight in role_posterior.items():
+            if role_weight <= 0.0:
+                continue
+            role_stats = self._meta.get_role_stats(species, role_name, base_stats)
+            role_speed = role_stats.get("spe")
+            if not isinstance(role_speed, (int, float)):
+                continue
+            weighted_speed += float(role_weight) * float(role_speed)
+            total_weight += float(role_weight)
+        if total_weight <= 0.0:
+            return None
+        return weighted_speed / total_weight
+
+    def _speed_item_multiplier(
+        self,
+        mon: Pokemon,
+        role_posterior: Optional[Dict[str, float]] = None,
+    ) -> float:
+        item = (getattr(mon, "item", "") or "").strip()
+        if item in SPEED_BOOST_ITEMS:
+            return 1.5
+        if item in SPEED_DROP_ITEMS:
+            return 0.5
+        if item:
+            return 1.0
+        if not role_posterior:
+            return 1.0
+
+        species = getattr(mon, "species", None)
+        if not species:
+            return 1.0
+        item_marginals = self._meta.get_item_marginals(species, role_posterior)
+        if not item_marginals:
+            return 1.0
+
+        expected_multiplier = 0.0
+        total_prob = 0.0
+        for item_id, item_prob in item_marginals.items():
+            prob = _clamp01(float(item_prob))
+            if prob <= 0.0:
+                continue
+            if item_id in SPEED_BOOST_ITEMS:
+                multiplier = 1.5
+            elif item_id in SPEED_DROP_ITEMS:
+                multiplier = 0.5
+            else:
+                multiplier = 1.0
+            expected_multiplier += prob * multiplier
+            total_prob += prob
+        if total_prob <= 0.0:
+            return 1.0
+        return expected_multiplier / total_prob
 
     def _on_recharge(self, mon: Optional[Pokemon]) -> float:
         if mon is None:
@@ -725,31 +1077,155 @@ class BrentObservationVectorBuilder:
         attacker_role: Optional[str],
         defender_role: Optional[str],
     ) -> Tuple[float, float]:
-        attacker_id = _safe_identifier(attacker, attacker_role)
-        defender_id = _safe_identifier(defender, defender_role)
-        if attacker_id is None or defender_id is None:
-            return 0.0, 0.0
-        if not self._stats_defined(attacker) or not self._stats_defined(defender):
-            return 0.0, 0.0
+        # Bayesian filtering based on revealed moves/items
+        # 1. Identify species
+        att_species = attacker.species if attacker else "Pikachu"
+        def_species = defender.species if defender else "Pikachu"
+        
+        # 2. Get possible roles and weights
+        # For opponent, filter roles. For me, assume 100% current stats.
+        att_is_opp = (attacker == battle.opponent_active_pokemon)
+        def_is_opp = (defender == battle.opponent_active_pokemon)
+        
+        if att_is_opp:
+            att_roles = self._meta.filter_roles(att_species, list(attacker.moves.keys()), attacker.item)
+        else:
+            att_roles = {"Current": 1.0}
+            
+        if def_is_opp:
+            def_roles = self._meta.filter_roles(def_species, list(defender.moves.keys()), defender.item)
+        else:
+            def_roles = {"Current": 1.0}
 
-        cache_key = (attacker_id, defender_id, move.id)
-        cached = self._damage_cache.get(cache_key)
-        if cached is not None:
-            return cached
+        # 3. Sum weighted damage across all role pairings
+        weighted_min = 0.0
+        weighted_max = 0.0
+        
+        for a_role, a_weight in att_roles.items():
+            for d_role, d_weight in def_roles.items():
+                pair_weight = a_weight * d_weight
+                if pair_weight < 0.01: continue
+                
+                # Get stats for this pairing
+                if a_role == "Current":
+                    att_stats = attacker.stats
+                else:
+                    att_stats = self._meta.get_role_stats(att_species, a_role, attacker.base_stats)
+                
+                if d_role == "Current":
+                    def_stats = defender.stats
+                else:
+                    def_stats = self._meta.get_role_stats(def_species, d_role, defender.base_stats)
+                
+                # Calculate damage with these stats
+                # Using a manual formula if mon.stats is missing to avoid poke-env identifier issues
+                d_min, d_max = self._manual_damage_calc(
+                    attacker, defender, move, battle, att_stats, def_stats
+                )
+                weighted_min += d_min * pair_weight
+                weighted_max += d_max * pair_weight
+        
+        return weighted_min, weighted_max
 
-        try:
-            min_damage, max_damage = calculate_damage(attacker_id, defender_id, move, battle)
-        except Exception:
-            return 0.0, 0.0
+    def _manual_damage_calc(
+        self,
+        attacker: Pokemon,
+        defender: Pokemon,
+        move: Move,
+        battle: AbstractBattle,
+        att_stats: Dict[str, Optional[int]],
+        def_stats: Dict[str, Optional[int]],
+    ) -> Tuple[float, float]:
+        # Robust Damage Formula (Generation 9)
+        level = attacker.level or 80
+        fixed_damage = self._fixed_damage_amount(attacker, defender, move, battle)
+        if fixed_damage is not None:
+            return fixed_damage, fixed_damage
 
-        damage_range = (float(min_damage), float(max_damage))
-        self._damage_cache[cache_key] = damage_range
-        return damage_range
+        bp = float(getattr(move, "base_power", 0))
+        if bp == 0: bp = 5.0 # Min signal for status moves to differentiate types
+        
+        category = move.category
+        if category == MoveCategory.PHYSICAL:
+            a = float(att_stats.get("atk") or 100)
+            d = float(def_stats.get("def") or 100)
+        else:
+            a = float(att_stats.get("spa") or 100)
+            d = float(def_stats.get("spd") or 100)
+            
+        # Boosts
+        a_boost = _stat_stage_multiplier(attacker.boosts.get("atk" if category == MoveCategory.PHYSICAL else "spa", 0))
+        d_boost = _stat_stage_multiplier(defender.boosts.get("def" if category == MoveCategory.PHYSICAL else "spd", 0))
+        
+        a *= a_boost
+        d *= d_boost
+        
+        # Base damage
+        base_damage = (((2 * level / 5 + 2) * bp * a / d) / 50) + 2
+        
+        # Modifiers
+        move_type = self._resolve_move_type(attacker, move, battle)
+        type_mult = move_type.damage_multiplier(defender.type_1, defender.type_2, type_chart=self._gen_data.type_chart)
+        stab = 1.5 if move_type in attacker.types else 1.0
+        
+        # Weather/Burn
+        weather_mult = 1.0
+        if move_type == PokemonType.FIRE:
+            if Weather.SUNNYDAY in battle.weather: weather_mult = 1.5
+            elif Weather.RAINDANCE in battle.weather: weather_mult = 0.5
+        elif move_type == PokemonType.WATER:
+            if Weather.RAINDANCE in battle.weather: weather_mult = 1.5
+            elif Weather.SUNNYDAY in battle.weather: weather_mult = 0.5
+            
+        burn_mult = 0.5 if (attacker.status == Status.BRN and category == MoveCategory.PHYSICAL) else 1.0
+        
+        total_mult = type_mult * stab * weather_mult * burn_mult
+        
+        final_min = base_damage * total_mult * 0.85
+        final_max = base_damage * total_mult * 1.0
+        
+        return final_min, final_max
+
+    def _fixed_damage_amount(
+        self,
+        attacker: Pokemon,
+        defender: Pokemon,
+        move: Move,
+        battle: AbstractBattle,
+    ) -> Optional[float]:
+        raw_damage = getattr(move, "damage", 0)
+        if raw_damage in (None, 0):
+            return None
+
+        move_type = self._resolve_move_type(attacker, move, battle)
+        type_mult = move_type.damage_multiplier(
+            defender.type_1,
+            defender.type_2,
+            type_chart=self._gen_data.type_chart,
+        )
+        if type_mult == 0.0:
+            return 0.0
+
+        if isinstance(raw_damage, (int, float)):
+            return float(raw_damage)
+        if raw_damage == "level":
+            return float(getattr(attacker, "level", 80) or 80)
+        return None
 
     def _stats_defined(self, mon: Pokemon) -> bool:
         return all(isinstance(value, (int, float)) for value in mon.stats.values())
 
     def _defender_hp_scale(self, mon: Pokemon) -> float:
+        # Try meta-stats first for opponents
+        species = mon.species if mon else None
+        spec = self._meta.get_species_data(species) if species else None
+        if spec:
+            # Use level and base HP to estimate max HP
+            level = spec.get("level", 80)
+            base_hp = mon.base_stats.get("hp", 100)
+            # Standard Randbats HP (usually 84 EVs)
+            return float(self._meta.calculate_stat(base_hp, level, ev=84, is_hp=True))
+            
         hp_stat = mon.stats.get("hp")
         if isinstance(hp_stat, (int, float)) and hp_stat > 0:
             return float(hp_stat)
@@ -875,6 +1351,112 @@ class BrentObservationVectorBuilder:
                 return float(raw_drain[0]) / float(raw_drain[1])
             return 0.0
 
+    def _move_self_delta(self, move: Move, stat: str) -> float:
+        try:
+            boosts = getattr(move, "self_boost", None)
+        except Exception:
+            boosts = None
+        if not isinstance(boosts, dict):
+            entry = getattr(move, "entry", {}) or {}
+            if isinstance(entry.get("selfBoost"), dict):
+                boosts = entry["selfBoost"].get("boosts")
+            elif isinstance(entry.get("self"), dict):
+                boosts = entry["self"].get("boosts")
+        if not isinstance(boosts, dict):
+            return 0.0
+        return _clamp(float(boosts.get(stat, 0)) / 2.0, -1.0, 1.0)
+
+    def _move_recoil_ratio(self, move: Move) -> float:
+        try:
+            return _clamp01(float(move.recoil))
+        except Exception:
+            entry = getattr(move, "entry", {}) or {}
+            raw_recoil = entry.get("recoil")
+            if isinstance(raw_recoil, (list, tuple)) and len(raw_recoil) == 2 and raw_recoil[1]:
+                return _clamp01(float(raw_recoil[0]) / float(raw_recoil[1]))
+            if entry.get("struggleRecoil"):
+                return 0.25
+            return 0.0
+
+    def _estimated_recoil_fraction(
+        self,
+        attacker: Pokemon,
+        defender: Pokemon,
+        move: Move,
+        expected_value: float,
+    ) -> float:
+        recoil_ratio = self._move_recoil_ratio(move)
+        if recoil_ratio <= 0.0:
+            return 0.0
+        defender_hp = self._defender_hp_scale(defender)
+        attacker_hp = self._defender_hp_scale(attacker)
+        if attacker_hp <= 0.0:
+            return 0.0
+        expected_damage = expected_value * defender_hp
+        return _clamp01((expected_damage * recoil_ratio) / attacker_hp)
+
+    def _move_causes_recharge(self, move: Move) -> float:
+        entry = getattr(move, "entry", {}) or {}
+        if entry.get("recharge"):
+            return 1.0
+        return 1.0 if bool(getattr(move, "recharge", False)) else 0.0
+
+    def _move_effect_chance(
+        self,
+        move: Move,
+        *,
+        statuses: Tuple[Status, ...] = (),
+        volatile_effect: Optional[Effect] = None,
+    ) -> float:
+        best = 0.0
+
+        direct_status = getattr(move, "status", None)
+        if direct_status in statuses:
+            best = 1.0
+
+        entry = getattr(move, "entry", {}) or {}
+        if volatile_effect is not None and self._entry_effect(entry.get("volatileStatus")) == volatile_effect:
+            best = 1.0
+
+        secondary_effects = getattr(move, "secondary", None)
+        if not isinstance(secondary_effects, list):
+            if isinstance(entry.get("secondary"), dict):
+                secondary_effects = [entry["secondary"]]
+            elif isinstance(entry.get("secondaries"), list):
+                secondary_effects = entry["secondaries"]
+            else:
+                secondary_effects = []
+
+        for secondary in secondary_effects:
+            if not isinstance(secondary, dict):
+                continue
+            chance = _clamp01(float(secondary.get("chance", 100)) / 100.0)
+            if self._entry_status(secondary.get("status")) in statuses:
+                best = max(best, chance)
+            if volatile_effect is not None and self._entry_effect(secondary.get("volatileStatus")) == volatile_effect:
+                best = max(best, chance)
+        return best
+
+    def _entry_status(self, raw_status: Any) -> Optional[Status]:
+        if isinstance(raw_status, Status):
+            return raw_status
+        if not raw_status:
+            return None
+        try:
+            return Status[str(raw_status).upper()]
+        except Exception:
+            return None
+
+    def _entry_effect(self, raw_effect: Any) -> Optional[Effect]:
+        if isinstance(raw_effect, Effect):
+            return raw_effect
+        if not raw_effect:
+            return None
+        try:
+            return Effect.from_data(str(raw_effect))
+        except Exception:
+            return None
+
     def _move_heal_amount(self, move: Move, battle: AbstractBattle) -> float:
         if move.id in WEATHER_HEAL_MOVES:
             if Weather.SUNNYDAY in battle.weather:
@@ -896,6 +1478,18 @@ class BrentObservationVectorBuilder:
             if isinstance(raw_heal, (list, tuple)) and len(raw_heal) == 2 and raw_heal[1]:
                 return float(raw_heal[0]) / float(raw_heal[1])
             return 0.0
+
+    def _effective_move_heal_amount(
+        self,
+        move: Move,
+        user: Optional[Pokemon],
+        battle: AbstractBattle,
+    ) -> float:
+        raw_heal = self._move_heal_amount(move, battle)
+        if user is None:
+            return raw_heal
+        missing_hp = 1.0 - _clamp01(_safe_hp_fraction(user))
+        return min(raw_heal, missing_hp)
 
     def _record_move_fallback(
         self,
@@ -954,6 +1548,26 @@ class BrentsRLAgent(SinglesEnv):
         )
         super().__init__(*args, **kwargs)
         self.vector_builder = BrentObservationVectorBuilder()
+        self._tactical_reward_context: TacticalRewardContext | None = None
+        self._strategic_penalty_counts: Dict[str, int] = {}
+        self._strategic_penalty_total = 0.0
+        self._strategic_penalty_move_checks = 0
+        self._strategic_penalty_penalized_actions = 0
+        self._tactical_shaping_counts: Dict[str, int] = {}
+        self._tactical_shaping_totals: Dict[str, float] = {}
+        self._tactical_shaping_total = 0.0
+        self._tactical_positive_total = 0.0
+        self._tactical_negative_total = 0.0
+        self._tactical_shaping_move_checks = 0
+        self._tactical_shaping_shaped_actions = 0
+        self._tactical_shaping_rewarded_actions = 0
+        self._tactical_shaping_penalized_actions = 0
+        self._decision_audit_counts: Dict[str, int] = {}
+        self._decision_audit_flagged_actions = 0
+        self._decision_audit_move_checks = 0
+        self._decision_audit_samples: Dict[str, list[Dict[str, Any]]] = {}
+        self._decision_count = 0
+        self._switch_action_count = 0
         self.observation_spaces = {
             agent: Box(
                 low=-1.0,
@@ -965,7 +1579,1034 @@ class BrentsRLAgent(SinglesEnv):
         }
 
     def calc_reward(self, battle: AbstractBattle) -> float:
-        return self.reward_computing_helper(battle, **REWARD_CONFIG)
+        base_config = {key: REWARD_CONFIG[key] for key in POKE_ENV_REWARD_KEYS}
+        reward = self.reward_computing_helper(battle, **base_config)
+        shaping = self._consume_tactical_shaping(battle)
+        return reward + shaping
+
+    def action_to_order(
+        self,
+        action: np.int64,
+        battle: AbstractBattle,
+        fake: bool = False,
+        strict: bool = True,
+    ) -> BattleOrder:
+        order = super().action_to_order(action, battle, fake=fake, strict=strict)
+        self._record_action_choice(order)
+        self._remember_tactical_reward_context(battle, order)
+        return order
+
+    def _record_action_choice(self, order: BattleOrder) -> None:
+        action = getattr(order, "order", None)
+        if isinstance(action, (Move, Pokemon)):
+            self._decision_count += 1
+        if isinstance(action, Pokemon):
+            self._switch_action_count += 1
+
+    def _remember_tactical_reward_context(
+        self,
+        battle: AbstractBattle,
+        order: BattleOrder,
+    ) -> None:
+        action = getattr(order, "order", None)
+        if not isinstance(action, (Move, Pokemon)):
+            self._tactical_reward_context = None
+            return
+
+        matches = tuple(self._evaluate_tactical_levers(battle, order))
+        self._tactical_reward_context = TacticalRewardContext(
+            battle_tag=_battle_tag(battle),
+            action=action,
+            matches=matches,
+        )
+        self._audit_tactical_matches(battle, order, action, matches)
+
+    def _audit_tactical_matches(
+        self,
+        battle: AbstractBattle,
+        order: BattleOrder,
+        action: Move | Pokemon,
+        matches: Sequence[TacticalLeverMatch],
+    ) -> None:
+        if not isinstance(action, Move):
+            return
+
+        self._decision_audit_move_checks += 1
+        audit_matches = [match for match in matches if match.record_audit]
+        if not audit_matches:
+            return
+
+        self._decision_audit_flagged_actions += 1
+        for match in audit_matches:
+            self._record_decision_audit(match.reason, battle, order, action, match.details)
+
+    def _consume_tactical_shaping(self, battle: AbstractBattle) -> float:
+        context = self._tactical_reward_context
+        if context is None or context.battle_tag != _battle_tag(battle):
+            return 0.0
+        self._tactical_reward_context = None
+        return self._apply_tactical_shaping(context)
+
+    def _apply_tactical_shaping(self, context: TacticalRewardContext) -> float:
+        if isinstance(context.action, Move):
+            self._strategic_penalty_move_checks += 1
+            self._tactical_shaping_move_checks += 1
+
+        shaping_matches = [match for match in context.matches if match.reward != 0.0]
+        if not shaping_matches:
+            return 0.0
+
+        total_reward = 0.0
+        negative_reward = 0.0
+        for match in shaping_matches:
+            self._tactical_shaping_counts[match.reason] = self._tactical_shaping_counts.get(match.reason, 0) + 1
+            self._tactical_shaping_totals[match.reason] = (
+                self._tactical_shaping_totals.get(match.reason, 0.0) + match.reward
+            )
+            total_reward += match.reward
+            if match.reward < 0.0:
+                negative_reward += match.reward
+                self._strategic_penalty_counts[match.reason] = self._strategic_penalty_counts.get(match.reason, 0) + 1
+
+        self._tactical_shaping_total += total_reward
+        if total_reward > 0.0:
+            self._tactical_positive_total += total_reward
+            self._tactical_shaping_rewarded_actions += 1
+        if total_reward < 0.0:
+            self._tactical_negative_total += total_reward
+            self._tactical_shaping_penalized_actions += 1
+        self._tactical_shaping_shaped_actions += 1
+
+        if negative_reward < 0.0:
+            self._strategic_penalty_penalized_actions += 1
+            self._strategic_penalty_total += negative_reward
+
+        return total_reward
+
+    def _evaluate_tactical_levers(
+        self,
+        battle: AbstractBattle,
+        order: BattleOrder,
+    ) -> list[TacticalLeverMatch]:
+        action = getattr(order, "order", None)
+        if isinstance(action, Move):
+            return self._evaluate_move_tactical_levers(battle, action)
+        if isinstance(action, Pokemon):
+            return self._evaluate_switch_tactical_levers(battle, action)
+        return []
+
+    def _make_tactical_match(
+        self,
+        reason: str,
+        reward_key: str,
+        details: Optional[Dict[str, Any]],
+        *,
+        record_audit: bool = False,
+    ) -> Optional[TacticalLeverMatch]:
+        if details is None:
+            return None
+
+        reward = float(REWARD_CONFIG.get(reward_key, 0.0))
+        if reward == 0.0 and not record_audit:
+            return None
+        return TacticalLeverMatch(reason=reason, reward=reward, details=details, record_audit=record_audit)
+
+    def _evaluate_move_tactical_levers(
+        self,
+        battle: AbstractBattle,
+        move: Move,
+    ) -> list[TacticalLeverMatch]:
+        matches: list[TacticalLeverMatch] = []
+        for reason, reward_key, details, record_audit in (
+            (
+                "redundant_stealthrock",
+                "penalty_redundant_stealthrock",
+                self._evaluate_redundant_stealthrock(battle, move),
+                False,
+            ),
+            (
+                "redundant_stickyweb",
+                "penalty_redundant_stickyweb",
+                self._evaluate_redundant_stickyweb(battle, move),
+                False,
+            ),
+            (
+                "redundant_spikes",
+                "penalty_redundant_spikes",
+                self._evaluate_redundant_spikes(battle, move),
+                False,
+            ),
+            (
+                "redundant_status",
+                "penalty_redundant_status",
+                self._evaluate_redundant_status(battle, move),
+                False,
+            ),
+            (
+                "bad_encore",
+                "penalty_bad_encore",
+                self._evaluate_bad_encore(battle, move),
+                False,
+            ),
+            (
+                "ineffective_heal",
+                "penalty_ineffective_heal",
+                self._evaluate_ineffective_heal(battle, move),
+                False,
+            ),
+            (
+                "wasteful_heal_overflow",
+                "penalty_wasteful_heal_overflow",
+                self._evaluate_wasteful_heal_overflow(battle, move),
+                True,
+            ),
+            (
+                "redundant_self_drop_move",
+                "penalty_redundant_self_drop_move",
+                self._evaluate_redundant_self_drop_move(battle, move),
+                True,
+            ),
+            (
+                "unsafe_stay_in_with_fast_ko_switch",
+                "penalty_unsafe_stay_in_with_fast_ko_switch",
+                self._evaluate_unsafe_stay_in_with_fast_ko_switch(battle, move),
+                True,
+            ),
+            (
+                "good_heal_timing",
+                "bonus_good_heal_timing",
+                self._evaluate_good_heal_timing(battle, move),
+                False,
+            ),
+            (
+                "good_attack_selection",
+                "bonus_good_attack_selection",
+                self._evaluate_good_attack_selection(battle, move),
+                False,
+            ),
+        ):
+            match = self._make_tactical_match(
+                reason,
+                reward_key,
+                details,
+                record_audit=record_audit,
+            )
+            if match is not None:
+                matches.append(match)
+        return matches
+
+    def _evaluate_switch_tactical_levers(
+        self,
+        battle: AbstractBattle,
+        switch_target: Pokemon,
+    ) -> list[TacticalLeverMatch]:
+        match = self._make_tactical_match(
+            "good_safe_switch",
+            "bonus_good_safe_switch",
+            self._evaluate_good_safe_switch(battle, switch_target),
+        )
+        return [match] if match is not None else []
+
+    def _move_has_status(self, move: Move) -> bool:
+        try:
+            return move.status is not None
+        except Exception:
+            entry = getattr(move, "entry", {}) or {}
+            return entry.get("status") is not None
+
+    def _move_has_heal(self, move: Move) -> bool:
+        if move.id in WEATHER_HEAL_MOVES:
+            return True
+        try:
+            return float(move.heal) > 0.0
+        except Exception:
+            entry = getattr(move, "entry", {}) or {}
+            raw_heal = entry.get("heal")
+            if isinstance(raw_heal, (list, tuple)) and len(raw_heal) == 2 and raw_heal[1]:
+                return float(raw_heal[0]) > 0.0
+            return False
+
+    def _heal_summary(
+        self,
+        battle: AbstractBattle,
+        move: Move,
+    ) -> Optional[Dict[str, Any]]:
+        active = battle.active_pokemon
+        if active is None:
+            return None
+
+        raw_heal = self.vector_builder._move_heal_amount(move, battle)
+        if raw_heal <= 0.0:
+            return None
+
+        effective_heal = self.vector_builder._effective_move_heal_amount(
+            move,
+            active,
+            battle,
+        )
+        hp_fraction = _safe_hp_fraction(active)
+        return {
+            "active_hp_fraction": round(hp_fraction, 3),
+            "raw_heal": round(raw_heal, 3),
+            "effective_heal": round(effective_heal, 3),
+            "overflow": round(max(0.0, raw_heal - effective_heal), 3),
+        }
+
+    def _evaluate_redundant_stealthrock(
+        self,
+        battle: AbstractBattle,
+        move: Move,
+    ) -> Optional[Dict[str, Any]]:
+        if move.id != "stealthrock" or SideCondition.STEALTH_ROCK not in battle.opponent_side_conditions:
+            return None
+        return {"opponent_has_stealthrock": True}
+
+    def _evaluate_redundant_stickyweb(
+        self,
+        battle: AbstractBattle,
+        move: Move,
+    ) -> Optional[Dict[str, Any]]:
+        if move.id != "stickyweb" or SideCondition.STICKY_WEB not in battle.opponent_side_conditions:
+            return None
+        return {"opponent_has_stickyweb": True}
+
+    def _evaluate_redundant_spikes(
+        self,
+        battle: AbstractBattle,
+        move: Move,
+    ) -> Optional[Dict[str, Any]]:
+        layers = int(battle.opponent_side_conditions.get(SideCondition.SPIKES, 0))
+        if move.id != "spikes" or layers < 3:
+            return None
+        return {"opponent_spikes_layers": layers}
+
+    def _evaluate_redundant_status(
+        self,
+        battle: AbstractBattle,
+        move: Move,
+    ) -> Optional[Dict[str, Any]]:
+        opponent = battle.opponent_active_pokemon
+        if not self._move_has_status(move) or opponent is None or opponent.status is None:
+            return None
+        status_name = getattr(opponent.status, "name", str(opponent.status))
+        return {"opponent_status": status_name}
+
+    def _evaluate_bad_encore(
+        self,
+        battle: AbstractBattle,
+        move: Move,
+    ) -> Optional[Dict[str, Any]]:
+        opponent = battle.opponent_active_pokemon
+        if move.id != "encore" or opponent is None or getattr(opponent, "last_move", None):
+            return None
+        return {"opponent_had_last_move": False}
+
+    def _evaluate_ineffective_heal(
+        self,
+        battle: AbstractBattle,
+        move: Move,
+    ) -> Optional[Dict[str, Any]]:
+        heal = self._heal_summary(battle, move)
+        if heal is None or float(heal["active_hp_fraction"]) <= 0.9:
+            return None
+        return heal
+
+    def _evaluate_wasteful_heal_overflow(
+        self,
+        battle: AbstractBattle,
+        move: Move,
+    ) -> Optional[Dict[str, Any]]:
+        heal = self._heal_summary(battle, move)
+        if heal is None:
+            return None
+
+        hp_fraction = float(heal["active_hp_fraction"])
+        overflow = float(heal["overflow"])
+        effective_heal = float(heal["effective_heal"])
+        raw_heal = max(float(heal["raw_heal"]), 1e-6)
+        if hp_fraction < 0.75 or overflow < 0.15:
+            return None
+        if effective_heal > raw_heal * 0.4:
+            return None
+        return heal
+
+    def _evaluate_good_heal_timing(
+        self,
+        battle: AbstractBattle,
+        move: Move,
+    ) -> Optional[Dict[str, Any]]:
+        heal = self._heal_summary(battle, move)
+        if heal is None:
+            return None
+
+        hp_fraction = float(heal["active_hp_fraction"])
+        effective_heal = float(heal["effective_heal"])
+        overflow = float(heal["overflow"])
+        threat = self._assess_battle_threats(battle)
+        under_pressure = (
+            hp_fraction <= 0.35
+            or threat.active_max_threat >= 0.45
+            or threat.active_ohko_risk >= 0.15
+        )
+        if hp_fraction > 0.6 or effective_heal < 0.2 or overflow > 0.15 or not under_pressure:
+            return None
+
+        return {
+            **heal,
+            "active_max_threat": round(threat.active_max_threat, 3),
+            "active_ohko_risk": round(threat.active_ohko_risk, 3),
+        }
+
+    def _evaluate_redundant_self_drop_move(
+        self,
+        battle: AbstractBattle,
+        move: Move,
+    ) -> Optional[Dict[str, Any]]:
+        active = battle.active_pokemon
+        opponent = battle.opponent_active_pokemon
+        if active is None or opponent is None:
+            return None
+
+        self_boosts = self._move_self_boosts(move)
+        if not self_boosts:
+            return None
+
+        relevant_stat = "spa" if move.category == MoveCategory.SPECIAL else "atk"
+        if self_boosts.get(relevant_stat, 0) >= 0:
+            return None
+
+        current_stage = int(active.boosts.get(relevant_stat, 0))
+        if current_stage > -2:
+            return None
+
+        chosen_ev, chosen_max = self._move_expected_metrics(battle, active, opponent, move)
+        opponent_hp = _safe_hp_fraction(opponent)
+        if opponent_hp > 0.0 and chosen_max >= opponent_hp:
+            return None
+
+        best_alt = self._best_move_choice(
+            battle,
+            active,
+            opponent,
+            exclude_move_id=move.id,
+            damaging_only=True,
+        )
+        best_alt_ev = best_alt["expected_value"] if best_alt is not None else 0.0
+
+        if chosen_ev >= 0.25 and best_alt_ev < chosen_ev * 0.85:
+            return None
+
+        return {
+            "stat": relevant_stat,
+            "current_stage": current_stage,
+            "chosen_expected_value": round(chosen_ev, 3),
+            "chosen_max_pct": round(chosen_max, 3),
+            "opponent_hp_fraction": round(opponent_hp, 3),
+            "best_alt_move": best_alt["move_id"] if best_alt is not None else None,
+            "best_alt_expected_value": round(max(best_alt_ev, 0.0), 3),
+        }
+
+    def _evaluate_good_attack_selection(
+        self,
+        battle: AbstractBattle,
+        move: Move,
+    ) -> Optional[Dict[str, Any]]:
+        active = battle.active_pokemon
+        opponent = battle.opponent_active_pokemon
+        if active is None or opponent is None or move.category == MoveCategory.STATUS:
+            return None
+
+        chosen_ev, chosen_max = self._move_expected_metrics(battle, active, opponent, move)
+        opponent_hp = _safe_hp_fraction(opponent)
+        if chosen_ev < 0.25 and chosen_max < opponent_hp:
+            return None
+        if self._move_has_unjustified_tradeoff(battle, active, opponent, move, chosen_ev, chosen_max):
+            return None
+
+        best_move = self._best_move_choice(
+            battle,
+            active,
+            opponent,
+            damaging_only=True,
+        )
+        if best_move is None:
+            return None
+
+        best_ev = float(best_move["expected_value"])
+        ko_pressure = opponent_hp > 0.0 and chosen_max >= opponent_hp
+        near_best = best_ev <= 0.0 or chosen_ev >= best_ev * 0.9
+        if not ko_pressure and not near_best:
+            return None
+
+        return {
+            "chosen_move": move.id,
+            "chosen_expected_value": round(chosen_ev, 3),
+            "chosen_max_pct": round(chosen_max, 3),
+            "opponent_hp_fraction": round(opponent_hp, 3),
+            "best_move": best_move["move_id"],
+            "best_expected_value": round(best_ev, 3),
+            "best_max_pct": round(float(best_move["max_pct"]), 3),
+            "secured_ko": bool(ko_pressure),
+        }
+
+    def _evaluate_unsafe_stay_in_with_fast_ko_switch(
+        self,
+        battle: AbstractBattle,
+        move: Move,
+    ) -> Optional[Dict[str, Any]]:
+        active = battle.active_pokemon
+        opponent = battle.opponent_active_pokemon
+        if active is None or opponent is None:
+            return None
+
+        chosen_ev, chosen_max = self._move_expected_metrics(battle, active, opponent, move)
+        opponent_hp = _safe_hp_fraction(opponent)
+        if opponent_hp > 0.0 and chosen_max >= opponent_hp:
+            return None
+
+        threat = self._assess_battle_threats(battle)
+        if not threat.threat_entries:
+            return None
+        if threat.active_max_threat < 0.6 and threat.active_ohko_risk < 0.25:
+            return None
+        if threat.opponent_speed is None:
+            return None
+
+        best_candidate: Optional[Dict[str, Any]] = None
+        for candidate in self._candidate_switches(battle):
+            candidate_metrics = self._switch_candidate_metrics(battle, candidate, threat)
+            if candidate_metrics is None:
+                continue
+            if not candidate_metrics["faster_or_equal"] or not candidate_metrics["resists_all_threats"]:
+                continue
+            if candidate_metrics["switch_max_threat"] > 0.35 or candidate_metrics["switch_ohko_risk"] > 0.1:
+                continue
+            if float(candidate_metrics["best_reply_max_pct"] or 0.0) < opponent_hp:
+                continue
+
+            best_candidate = candidate_metrics
+            break
+
+        if best_candidate is None:
+            return None
+
+        return {
+            "chosen_move": move.id,
+            "chosen_expected_value": round(chosen_ev, 3),
+            "chosen_max_pct": round(chosen_max, 3),
+            "active_max_threat": round(threat.active_max_threat, 3),
+            "active_ohko_risk": round(threat.active_ohko_risk, 3),
+            "opponent_hp_fraction": round(opponent_hp, 3),
+            **best_candidate,
+        }
+
+    def _evaluate_good_safe_switch(
+        self,
+        battle: AbstractBattle,
+        switch_target: Pokemon,
+    ) -> Optional[Dict[str, Any]]:
+        opponent = battle.opponent_active_pokemon
+        if opponent is None:
+            return None
+
+        threat = self._assess_battle_threats(battle)
+        if not threat.threat_entries:
+            return None
+        if threat.active_max_threat < 0.55 and threat.active_ohko_risk < 0.25:
+            return None
+
+        candidate_metrics = self._switch_candidate_metrics(battle, switch_target, threat)
+        if candidate_metrics is None:
+            return None
+        if not candidate_metrics["resists_all_threats"]:
+            return None
+        if candidate_metrics["switch_max_threat"] > 0.45 or candidate_metrics["switch_ohko_risk"] > 0.15:
+            return None
+
+        opponent_hp = _safe_hp_fraction(opponent)
+        if not self._has_credible_switch_reply(candidate_metrics, opponent_hp):
+            return None
+
+        improves_board = (
+            candidate_metrics["switch_max_threat"] + 0.15 < threat.active_max_threat
+            or candidate_metrics["switch_ohko_risk"] + 0.15 < threat.active_ohko_risk
+        )
+        if not improves_board:
+            return None
+
+        return {
+            "active_max_threat": round(threat.active_max_threat, 3),
+            "active_ohko_risk": round(threat.active_ohko_risk, 3),
+            "opponent_hp_fraction": round(opponent_hp, 3),
+            **candidate_metrics,
+        }
+
+    def _move_self_boosts(self, move: Move) -> Dict[str, int]:
+        try:
+            boosts = move.self_boost
+        except Exception:
+            boosts = None
+        if isinstance(boosts, dict):
+            return {str(stat): int(amount) for stat, amount in boosts.items()}
+
+        entry = getattr(move, "entry", {}) or {}
+        if isinstance(entry.get("self"), dict) and isinstance(entry["self"].get("boosts"), dict):
+            return {str(stat): int(amount) for stat, amount in entry["self"]["boosts"].items()}
+        if isinstance(entry.get("selfBoost"), dict) and isinstance(entry["selfBoost"].get("boosts"), dict):
+            return {str(stat): int(amount) for stat, amount in entry["selfBoost"]["boosts"].items()}
+        return {}
+
+    def _move_expected_metrics(
+        self,
+        battle: AbstractBattle,
+        attacker: Pokemon,
+        defender: Pokemon,
+        move: Move,
+    ) -> tuple[float, float]:
+        min_pct, max_pct = self.vector_builder._damage_range_percent(
+            battle,
+            attacker,
+            defender,
+            move,
+            battle.player_role,
+            battle.opponent_role,
+        )
+        accuracy = _clamp01(float(getattr(move, "accuracy", 1.0) or 1.0))
+        expected_value = _clamp01(((min_pct + max_pct) / 2.0) * accuracy)
+        return expected_value, max_pct
+
+    def _best_move_choice(
+        self,
+        battle: AbstractBattle,
+        attacker: Pokemon,
+        defender: Pokemon,
+        *,
+        exclude_move_id: str | None = None,
+        damaging_only: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        best_choice: Optional[Dict[str, Any]] = None
+        for candidate in tuple(battle.available_moves):
+            if candidate.id == exclude_move_id:
+                continue
+
+            expected_value, max_pct = self._move_expected_metrics(battle, attacker, defender, candidate)
+            if damaging_only and expected_value <= 0.0 and max_pct <= 0.0:
+                continue
+            if best_choice is None or expected_value > best_choice["expected_value"] or (
+                expected_value == best_choice["expected_value"] and max_pct > best_choice["max_pct"]
+            ):
+                best_choice = {
+                    "move_id": candidate.id,
+                    "expected_value": expected_value,
+                    "max_pct": max_pct,
+                }
+        return best_choice
+
+    def _move_has_unjustified_tradeoff(
+        self,
+        battle: AbstractBattle,
+        attacker: Pokemon,
+        defender: Pokemon,
+        move: Move,
+        expected_value: float,
+        max_pct: float,
+    ) -> bool:
+        opponent_hp = _safe_hp_fraction(defender)
+        if opponent_hp > 0.0 and max_pct >= opponent_hp:
+            return False
+
+        self_boosts = self._move_self_boosts(move)
+        relevant_stat = "spa" if move.category == MoveCategory.SPECIAL else "atk"
+        if self_boosts.get(relevant_stat, 0) < 0:
+            return True
+        if self.vector_builder._move_causes_recharge(move) >= 1.0:
+            return True
+
+        recoil = self.vector_builder._estimated_recoil_fraction(
+            attacker,
+            defender,
+            move,
+            expected_value,
+        )
+        return recoil > 0.25 and expected_value < 0.35
+
+    def _candidate_switches(self, battle: AbstractBattle) -> list[Pokemon]:
+        available_switches = getattr(battle, "available_switches", None)
+        if available_switches:
+            return [mon for mon in available_switches if mon is not None and not mon.fainted]
+        return [
+            mon
+            for mon in battle.team.values()
+            if mon is not None and not mon.active and not mon.fainted
+        ]
+
+    def _resists_all_threat_moves(
+        self,
+        battle: AbstractBattle,
+        attacker: Pokemon,
+        defender: Pokemon,
+        threat_entries: Sequence[OpponentThreatEntry],
+    ) -> bool:
+        for entry in threat_entries:
+            move_type = self.vector_builder._resolve_move_type(attacker, entry.move, battle)
+            type_mult = move_type.damage_multiplier(
+                defender.type_1,
+                defender.type_2,
+                type_chart=self.vector_builder._gen_data.type_chart,
+            )
+            if type_mult > 0.5:
+                return False
+        return True
+
+    def _assess_battle_threats(self, battle: AbstractBattle) -> ThreatAssessment:
+        active = battle.active_pokemon
+        opponent = battle.opponent_active_pokemon
+        if active is None or opponent is None:
+            return ThreatAssessment(
+                posterior={},
+                threat_entries=tuple(),
+                active_max_threat=0.0,
+                active_ohko_risk=0.0,
+                active_speed=None,
+                opponent_speed=None,
+            )
+
+        posterior = self.vector_builder._opponent_role_posterior(opponent)
+        threat_entries = tuple(
+            entry
+            for entry in self.vector_builder._select_opponent_threat_entries(opponent, posterior)
+            if entry.move.category != MoveCategory.STATUS and float(getattr(entry.move, "base_power", 0) or 0) > 0.0
+        )
+        active_max_threat = 0.0
+        if threat_entries:
+            active_max_threat = max(
+                self.vector_builder._move_expected_value(
+                    battle,
+                    opponent,
+                    active,
+                    entry.move,
+                    battle.opponent_role,
+                    battle.player_role,
+                )
+                for entry in threat_entries
+            )
+
+        active_ohko_risk = self.vector_builder._estimate_ohko_risk(
+            battle,
+            opponent,
+            active,
+            posterior,
+        )
+        active_speed = self.vector_builder._effective_speed(active, battle.side_conditions)
+        opponent_speed = self.vector_builder._effective_speed(
+            opponent,
+            battle.opponent_side_conditions,
+            role_posterior=posterior,
+        )
+        return ThreatAssessment(
+            posterior=posterior,
+            threat_entries=threat_entries,
+            active_max_threat=active_max_threat,
+            active_ohko_risk=active_ohko_risk,
+            active_speed=active_speed,
+            opponent_speed=opponent_speed,
+        )
+
+    def _best_known_bench_reply(
+        self,
+        battle: AbstractBattle,
+        attacker: Pokemon,
+        defender: Pokemon,
+    ) -> Optional[Dict[str, Any]]:
+        best_reply = None
+        for move in tuple(attacker.moves.values())[:4]:
+            _, max_pct = self._move_expected_metrics(battle, attacker, defender, move)
+            if best_reply is None or max_pct > best_reply["max_pct"]:
+                best_reply = {"move_id": move.id, "max_pct": max_pct}
+        return best_reply
+
+    def _switch_candidate_metrics(
+        self,
+        battle: AbstractBattle,
+        candidate: Pokemon,
+        threat: ThreatAssessment,
+    ) -> Optional[Dict[str, Any]]:
+        opponent = battle.opponent_active_pokemon
+        if opponent is None:
+            return None
+
+        candidate_speed = self.vector_builder._effective_speed(candidate, battle.side_conditions)
+        faster = (
+            candidate_speed is not None
+            and threat.opponent_speed is not None
+            and candidate_speed >= threat.opponent_speed
+        )
+        candidate_max_threat = 0.0
+        candidate_ohko_risk = 0.0
+        if threat.threat_entries:
+            candidate_max_threat = max(
+                self.vector_builder._move_expected_value(
+                    battle,
+                    opponent,
+                    candidate,
+                    entry.move,
+                    battle.opponent_role,
+                    battle.player_role,
+                )
+                for entry in threat.threat_entries
+            )
+            candidate_ohko_risk = self.vector_builder._estimate_ohko_risk(
+                battle,
+                opponent,
+                candidate,
+                threat.posterior,
+            )
+
+        best_reply = self._best_known_bench_reply(battle, candidate, opponent)
+        return {
+            "switch_species": getattr(candidate, "species", "<unknown>"),
+            "switch_hp_fraction": round(_safe_hp_fraction(candidate), 3),
+            "switch_speed": round(candidate_speed, 1) if candidate_speed is not None else None,
+            "faster_or_equal": bool(faster),
+            "resists_all_threats": self._resists_all_threat_moves(
+                battle,
+                opponent,
+                candidate,
+                threat.threat_entries,
+            )
+            if threat.threat_entries
+            else False,
+            "switch_max_threat": round(candidate_max_threat, 3),
+            "switch_ohko_risk": round(candidate_ohko_risk, 3),
+            "best_reply_move": best_reply["move_id"] if best_reply is not None else None,
+            "best_reply_max_pct": round(best_reply["max_pct"], 3) if best_reply is not None else None,
+        }
+
+    def _has_credible_switch_reply(
+        self,
+        candidate_metrics: Dict[str, Any],
+        opponent_hp_fraction: float,
+    ) -> bool:
+        best_reply_max_pct = float(candidate_metrics.get("best_reply_max_pct") or 0.0)
+        return best_reply_max_pct >= min(0.5, opponent_hp_fraction)
+
+    def _record_decision_audit(
+        self,
+        category: str,
+        battle: AbstractBattle,
+        order: BattleOrder,
+        move: Move,
+        details: Dict[str, Any],
+    ) -> None:
+        self._decision_audit_counts[category] = self._decision_audit_counts.get(category, 0) + 1
+        samples = self._decision_audit_samples.setdefault(category, [])
+        if len(samples) >= DECISION_AUDIT_SAMPLE_LIMIT:
+            return
+
+        active = battle.active_pokemon
+        opponent = battle.opponent_active_pokemon
+        threat = self._assess_battle_threats(battle)
+        feature_snapshot = self._decision_feature_snapshot(battle, move, threat)
+        samples.append(
+            {
+                "battle_tag": _battle_tag(battle),
+                "turn": getattr(battle, "turn", None),
+                "category": category,
+                "chosen_move": move.id,
+                "chosen_order": str(order),
+                "terastallize": bool(getattr(order, "terastallize", False)),
+                "active_species": getattr(active, "species", None),
+                "opponent_species": getattr(opponent, "species", None),
+                "active_hp_fraction": round(_safe_hp_fraction(active), 3),
+                "opponent_hp_fraction": round(_safe_hp_fraction(opponent), 3),
+                "active_boosts": {k: v for k, v in getattr(active, "boosts", {}).items() if v},
+                "opponent_boosts": {k: v for k, v in getattr(opponent, "boosts", {}).items() if v},
+                "bench_summary": [
+                    {
+                        "species": getattr(mon, "species", None),
+                        "hp_fraction": round(_safe_hp_fraction(mon), 3),
+                        "active": bool(getattr(mon, "active", False)),
+                        "fainted": bool(getattr(mon, "fainted", False)),
+                    }
+                    for mon in battle.team.values()
+                    if mon is not None and not getattr(mon, "active", False)
+                ][:5],
+                "top_opp_threats": [
+                    {
+                        "move_id": entry.move.id,
+                        "move_prob": round(entry.move_prob, 3),
+                        "revealed": bool(entry.revealed_flag),
+                    }
+                    for entry in threat.threat_entries[:4]
+                ],
+                "feature_snapshot": feature_snapshot,
+                "details": details,
+            }
+        )
+
+    def _decision_feature_snapshot(
+        self,
+        battle: AbstractBattle,
+        chosen_move: Move,
+        threat: ThreatAssessment,
+    ) -> Dict[str, Any]:
+        vector = self.vector_builder.embed_battle(battle)
+
+        move_block = self._move_block_snapshot(battle, vector, chosen_move)
+        return {
+            "speed": {
+                "speed_advantage_feature": round(float(vector[SPEED_ADVANTAGE_INDEX]), 3),
+                "active_speed_est": round(float(threat.active_speed), 1) if threat.active_speed is not None else None,
+                "opponent_speed_est": round(float(threat.opponent_speed), 1) if threat.opponent_speed is not None else None,
+            },
+            "chosen_move_block": move_block,
+            "threat_summary": {
+                "active_max_threat": round(threat.active_max_threat, 3),
+                "active_ohko_risk": round(threat.active_ohko_risk, 3),
+                "opponent_top_role_mass": round(float(vector[OPP_THREAT_CONFIDENCE_START]), 3),
+                "opponent_role_entropy_norm": round(float(vector[OPP_THREAT_CONFIDENCE_START + 1]), 3),
+                "top_moves": [
+                    {
+                        "move_id": entry.move.id,
+                        "move_prob": round(entry.move_prob, 3),
+                        "revealed": bool(entry.revealed_flag),
+                    }
+                    for entry in threat.threat_entries[:4]
+                ],
+            },
+            "switch_options": self._safe_switch_snapshot(battle, threat),
+        }
+
+    def _move_block_snapshot(
+        self,
+        battle: AbstractBattle,
+        vector: np.ndarray,
+        chosen_move: Move,
+    ) -> Dict[str, Any]:
+        for slot, move in enumerate(tuple(battle.available_moves)[:4]):
+            if move.id != chosen_move.id:
+                continue
+            start = MY_MOVES_START + slot * MOVE_BLOCK_SIZE
+            block = vector[start : start + MOVE_BLOCK_SIZE]
+            return {
+                "slot": slot,
+                "move_id": move.id,
+                "min_pct": round(float(block[0]), 3),
+                "max_pct": round(float(block[1]), 3),
+                "accuracy": round(float(block[2]), 3),
+                "expected_value": round(float(block[3]), 3),
+                "ko_flag": int(block[4]),
+                "heal": round(float(block[12]), 3),
+                "drain": round(float(block[13]), 3),
+                "self_atk_delta": round(float(block[14]), 3),
+                "self_spa_delta": round(float(block[15]), 3),
+                "self_spe_delta": round(float(block[16]), 3),
+                "recoil": round(float(block[17]), 3),
+                "recharge": int(block[18]),
+                "brn": round(float(block[19]), 3),
+                "par": round(float(block[20]), 3),
+                "psn": round(float(block[21]), 3),
+                "frz": round(float(block[22]), 3),
+                "slp": round(float(block[23]), 3),
+                "conf": round(float(block[24]), 3),
+            }
+        return {"move_id": chosen_move.id, "slot": None}
+
+    def _safe_switch_snapshot(
+        self,
+        battle: AbstractBattle,
+        threat: ThreatAssessment,
+    ) -> list[Dict[str, Any]]:
+        if battle.active_pokemon is None or battle.opponent_active_pokemon is None:
+            return []
+
+        candidates: list[Dict[str, Any]] = []
+        for candidate in self._candidate_switches(battle):
+            candidate_metrics = self._switch_candidate_metrics(battle, candidate, threat)
+            if candidate_metrics is None:
+                continue
+            candidates.append(
+                {
+                    "species": candidate_metrics["switch_species"],
+                    "hp_fraction": candidate_metrics["switch_hp_fraction"],
+                    "faster_or_equal": candidate_metrics["faster_or_equal"],
+                    "resists_all_threats": candidate_metrics["resists_all_threats"],
+                    "max_threat": candidate_metrics["switch_max_threat"],
+                    "ohko_risk": candidate_metrics["switch_ohko_risk"],
+                    "best_reply_move": candidate_metrics["best_reply_move"],
+                    "best_reply_max_pct": candidate_metrics["best_reply_max_pct"],
+                }
+            )
+
+        candidates.sort(
+            key=lambda item: (
+                -int(item["faster_or_equal"]),
+                -int(item["resists_all_threats"]),
+                item["ohko_risk"],
+                -float(item["best_reply_max_pct"] or 0.0),
+            )
+        )
+        return candidates[:3]
+
+    def get_tactical_shaping_report(self) -> dict[str, Any]:
+        return {
+            "decision_count": self._decision_count,
+            "move_checks": self._tactical_shaping_move_checks,
+            "switch_actions": self._switch_action_count,
+            "switch_rate": (
+                self._switch_action_count / self._decision_count if self._decision_count else 0.0
+            ),
+            "shaped_actions": self._tactical_shaping_shaped_actions,
+            "rewarded_actions": self._tactical_shaping_rewarded_actions,
+            "penalized_actions": self._tactical_shaping_penalized_actions,
+            "shaped_action_rate": (
+                self._tactical_shaping_shaped_actions / self._decision_count if self._decision_count else 0.0
+            ),
+            "total_shaping": self._tactical_shaping_total,
+            "positive_total": self._tactical_positive_total,
+            "negative_total": self._tactical_negative_total,
+            "counts": dict(sorted(self._tactical_shaping_counts.items())),
+            "totals": {
+                category: round(total, 3)
+                for category, total in sorted(self._tactical_shaping_totals.items())
+            },
+        }
+
+    def get_strategic_penalty_report(self) -> dict[str, Any]:
+        return {
+            "decision_count": self._decision_count,
+            "move_checks": self._strategic_penalty_move_checks,
+            "switch_actions": self._switch_action_count,
+            "switch_rate": (
+                self._switch_action_count / self._decision_count if self._decision_count else 0.0
+            ),
+            "penalized_actions": self._strategic_penalty_penalized_actions,
+            "total_penalty": self._strategic_penalty_total,
+            "penalized_action_rate": (
+                self._strategic_penalty_penalized_actions / self._strategic_penalty_move_checks
+                if self._strategic_penalty_move_checks
+                else 0.0
+            ),
+            "counts": dict(sorted(self._strategic_penalty_counts.items())),
+        }
+
+    def get_decision_audit_report(self) -> dict[str, Any]:
+        return {
+            "decision_count": self._decision_count,
+            "move_checks": self._decision_audit_move_checks,
+            "switch_actions": self._switch_action_count,
+            "switch_rate": (
+                self._switch_action_count / self._decision_count if self._decision_count else 0.0
+            ),
+            "flagged_actions": self._decision_audit_flagged_actions,
+            "flagged_action_rate": (
+                self._decision_audit_flagged_actions / self._decision_audit_move_checks
+                if self._decision_audit_move_checks
+                else 0.0
+            ),
+            "counts": dict(sorted(self._decision_audit_counts.items())),
+            "samples": {category: list(samples) for category, samples in sorted(self._decision_audit_samples.items())},
+        }
 
     def embed_battle(self, battle: AbstractBattle) -> np.ndarray:
         return self.vector_builder.embed_battle(battle)
@@ -975,6 +2616,8 @@ assert MY_MOVES_START + 4 * MOVE_BLOCK_SIZE == MY_BENCH_START
 assert MY_BENCH_START + 5 * MY_BENCH_SLOT_SIZE == OPP_BENCH_START
 assert OPP_BENCH_START + 5 * OPP_BENCH_SLOT_SIZE == TARGETING_START
 assert TARGETING_START + 20 == MY_TEAM_REVEALED_START
-assert MY_TEAM_REVEALED_START + 6 == OPP_MOVES_VS_ME_START
-assert OPP_MOVES_VS_ME_START + 24 == ON_RECHARGE_INDEX
+assert MY_TEAM_REVEALED_START + 6 == OPP_THREAT_START
+assert OPP_THREAT_START + OPP_THREAT_ROWS * OPP_THREAT_ROW_SIZE == OPP_THREAT_OHKO_START
+assert OPP_THREAT_OHKO_START + 6 == OPP_THREAT_CONFIDENCE_START
+assert OPP_THREAT_CONFIDENCE_START + 2 == ON_RECHARGE_INDEX
 assert ON_RECHARGE_INDEX + 1 == VECTOR_LENGTH

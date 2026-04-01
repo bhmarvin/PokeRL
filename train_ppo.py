@@ -15,6 +15,7 @@ os.environ.setdefault(
 )
 
 from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 from stable_baselines3.common.monitor import Monitor
 
 from poke_env.environment.single_agent_wrapper import SingleAgentWrapper
@@ -23,6 +24,72 @@ from brent_agent import BrentsRLAgent, REWARD_CONFIG, VECTOR_LENGTH
 from experiment_io import make_run_name, prepare_run_artifacts, write_summary
 from opponents import OPPONENT_CHOICES, create_opponent
 from policies import MaskedActorCriticPolicy
+
+
+def format_penalty_report(report: dict[str, Any]) -> str:
+    counts = report.get("counts", {})
+    counts_text = ", ".join(f"{key}={value}" for key, value in counts.items()) if counts else "none"
+    return (
+        "decision_count={decision_count} switch_actions={switch_actions} switch_rate={switch_rate:.3f} "
+        "move_checks={move_checks} penalized_actions={penalized_actions} "
+        "penalized_action_rate={penalized_action_rate:.3f} total_penalty={total_penalty:.3f} "
+        "counts=[{counts}]"
+    ).format(
+        decision_count=report.get("decision_count", 0),
+        move_checks=report.get("move_checks", 0),
+        penalized_actions=report.get("penalized_actions", 0),
+        switch_actions=report.get("switch_actions", 0),
+        switch_rate=report.get("switch_rate", 0.0),
+        penalized_action_rate=report.get("penalized_action_rate", 0.0),
+        total_penalty=report.get("total_penalty", 0.0),
+        counts=counts_text,
+    )
+
+
+def format_tactical_shaping_report(report: dict[str, Any]) -> str:
+    counts = report.get("counts", {})
+    totals = report.get("totals", {})
+    counts_text = ", ".join(f"{key}={value}" for key, value in counts.items()) if counts else "none"
+    totals_text = ", ".join(f"{key}={value:.3f}" for key, value in totals.items()) if totals else "none"
+    return (
+        "decision_count={decision_count} switch_actions={switch_actions} switch_rate={switch_rate:.3f} "
+        "move_checks={move_checks} shaped_actions={shaped_actions} rewarded_actions={rewarded_actions} "
+        "penalized_actions={penalized_actions} shaped_action_rate={shaped_action_rate:.3f} "
+        "total_shaping={total_shaping:.3f} positive_total={positive_total:.3f} "
+        "negative_total={negative_total:.3f} counts=[{counts}] totals=[{totals}]"
+    ).format(
+        decision_count=report.get("decision_count", 0),
+        move_checks=report.get("move_checks", 0),
+        shaped_actions=report.get("shaped_actions", 0),
+        rewarded_actions=report.get("rewarded_actions", 0),
+        penalized_actions=report.get("penalized_actions", 0),
+        switch_actions=report.get("switch_actions", 0),
+        switch_rate=report.get("switch_rate", 0.0),
+        shaped_action_rate=report.get("shaped_action_rate", 0.0),
+        total_shaping=report.get("total_shaping", 0.0),
+        positive_total=report.get("positive_total", 0.0),
+        negative_total=report.get("negative_total", 0.0),
+        counts=counts_text,
+        totals=totals_text,
+    )
+
+
+def format_decision_audit_report(report: dict[str, Any]) -> str:
+    counts = report.get("counts", {})
+    counts_text = ", ".join(f"{key}={value}" for key, value in counts.items()) if counts else "none"
+    return (
+        "decision_count={decision_count} switch_actions={switch_actions} switch_rate={switch_rate:.3f} "
+        "move_checks={move_checks} flagged_actions={flagged_actions} "
+        "flagged_action_rate={flagged_action_rate:.3f} counts=[{counts}]"
+    ).format(
+        decision_count=report.get("decision_count", 0),
+        move_checks=report.get("move_checks", 0),
+        flagged_actions=report.get("flagged_actions", 0),
+        switch_actions=report.get("switch_actions", 0),
+        switch_rate=report.get("switch_rate", 0.0),
+        flagged_action_rate=report.get("flagged_action_rate", 0.0),
+        counts=counts_text,
+    )
 
 
 @dataclass
@@ -59,6 +126,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name")
     parser.add_argument("--checkpoint-path")
     parser.add_argument("--resume-from")
+    parser.add_argument("--save-freq", type=int, default=50000, help="Save checkpoint every X steps")
+    parser.add_argument("--eval-freq", type=int, default=10000, help="Evaluate every X steps")
     return parser.parse_args()
 
 
@@ -108,9 +177,11 @@ def predict_masked_action(model: PPO, obs: dict[str, Any]) -> np.int64:
 def evaluate_policy(
     model: PPO,
     args: argparse.Namespace,
-) -> tuple[EvalSummary, list[EvalBattleRecord]]:
+) -> tuple[EvalSummary, list[EvalBattleRecord], dict[str, Any], dict[str, Any]]:
     env = create_wrapped_env(args, args.eval_opponent)
     records: list[EvalBattleRecord] = []
+    eval_decision_audit_report: dict[str, Any] = {}
+    eval_tactical_shaping_report: dict[str, Any] = {}
 
     try:
         for episode_idx in range(args.eval_battles):
@@ -145,6 +216,8 @@ def evaluate_policy(
                 f"[eval {episode_idx + 1}/{args.eval_battles}] "
                 f"won={record.won} steps={record.steps} reward={record.reward:.3f}"
             )
+        eval_decision_audit_report = env.unwrapped.env.get_decision_audit_report()
+        eval_tactical_shaping_report = env.unwrapped.env.get_tactical_shaping_report()
     finally:
         env.close()
 
@@ -159,13 +232,113 @@ def evaluate_policy(
         avg_reward=float(np.mean([record.reward for record in records]) if records else 0.0),
         avg_steps=float(np.mean([record.steps for record in records]) if records else 0.0),
     )
-    return summary, records
+    return summary, records, eval_decision_audit_report, eval_tactical_shaping_report
+
+
+class PokeEnvEvalCallback(BaseCallback):
+    """EvalCallback that creates a fresh poke-env each cycle to avoid stale battle state."""
+
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        eval_freq: int,
+        n_eval_episodes: int,
+        best_model_save_path: str,
+        log_path: str,
+        tracked_env: BrentsRLAgent | None = None,
+        verbose: int = 1,
+    ):
+        super().__init__(verbose)
+        self.args = args
+        self.eval_freq = eval_freq
+        self.n_eval_episodes = n_eval_episodes
+        self.best_model_save_path = best_model_save_path
+        self.log_path = log_path
+        self.tracked_env = tracked_env
+        self.best_mean_reward = -np.inf
+
+    def _on_step(self) -> bool:
+        if self.n_calls % self.eval_freq != 0:
+            return True
+
+        if self.verbose and self.tracked_env is not None:
+            print(
+                f"[train penalties @ {self.num_timesteps} steps] "
+                f"{format_penalty_report(self.tracked_env.get_strategic_penalty_report())}"
+            )
+            print(
+                f"[train shaping @ {self.num_timesteps} steps] "
+                f"{format_tactical_shaping_report(self.tracked_env.get_tactical_shaping_report())}"
+            )
+            print(
+                f"[train audit @ {self.num_timesteps} steps] "
+                f"{format_decision_audit_report(self.tracked_env.get_decision_audit_report())}"
+            )
+
+        env = create_wrapped_env(self.args, self.args.eval_opponent)
+        rewards: list[float] = []
+        steps: list[int] = []
+        wins = 0
+        losses = 0
+        eval_decision_audit_report: dict[str, Any] = {}
+        eval_tactical_shaping_report: dict[str, Any] = {}
+        try:
+            for ep in range(self.n_eval_episodes):
+                obs, _ = env.reset()
+                done, total_reward = False, 0.0
+                episode_steps = 0
+                while not done:
+                    action, _ = self.model.predict(obs, deterministic=True)
+                    obs, reward, terminated, truncated, _ = env.step(action)
+                    total_reward += float(reward)
+                    done = bool(terminated or truncated)
+                    episode_steps += 1
+                rewards.append(total_reward)
+                steps.append(episode_steps)
+                battle = env.unwrapped.env.battle1
+                wins += int(bool(getattr(battle, "won", False)))
+                losses += int(bool(getattr(battle, "lost", False)))
+            eval_decision_audit_report = env.unwrapped.env.get_decision_audit_report()
+            eval_tactical_shaping_report = env.unwrapped.env.get_tactical_shaping_report()
+        finally:
+            try:
+                env.close()
+            except OSError:
+                pass
+
+        mean_reward = float(np.mean(rewards))
+        mean_steps = float(np.mean(steps) if steps else 0.0)
+        draws = self.n_eval_episodes - wins - losses
+        win_rate = wins / self.n_eval_episodes if self.n_eval_episodes else 0.0
+        if self.verbose:
+            print(
+                f"[eval @ {self.num_timesteps} steps] wins={wins} losses={losses} "
+                f"draws={draws} win_rate={win_rate:.3f} mean_reward={mean_reward:.3f} "
+                f"avg_steps={mean_steps:.2f}"
+            )
+            print(
+                f"[eval audit @ {self.num_timesteps} steps] "
+                f"{format_decision_audit_report(eval_decision_audit_report)}"
+            )
+            print(
+                f"[eval shaping @ {self.num_timesteps} steps] "
+                f"{format_tactical_shaping_report(eval_tactical_shaping_report)}"
+            )
+
+        if mean_reward > self.best_mean_reward:
+            self.best_mean_reward = mean_reward
+            os.makedirs(self.best_model_save_path, exist_ok=True)
+            self.model.save(os.path.join(self.best_model_save_path, "best_model"))
+            if self.verbose:
+                print(f"  New best model saved (reward={mean_reward:.3f})")
+
+        return True
 
 
 def build_model(args: argparse.Namespace, env: Monitor) -> PPO:
     if args.resume_from:
         print(f"Loading PPO checkpoint from {args.resume_from}")
-        return PPO.load(args.resume_from, env=env, device=args.device)
+        return PPO.load(args.resume_from, env=env, device=args.device, tensorboard_log=os.path.join(args.output_dir, "logs"))
 
     return PPO(
         MaskedActorCriticPolicy,
@@ -174,10 +347,11 @@ def build_model(args: argparse.Namespace, env: Monitor) -> PPO:
         n_steps=512,
         batch_size=64,
         gamma=0.99,
-        ent_coef=0.01,
+        ent_coef=0.02,
         device=args.device,
         seed=args.seed,
         verbose=1,
+        tensorboard_log=os.path.join(args.output_dir, "logs"),
     )
 
 
@@ -193,12 +367,34 @@ def main() -> None:
 
     env = create_wrapped_env(args, args.train_opponent)
     env.reset(seed=args.seed)
+    train_env = env.unwrapped.env
     model = build_model(args, env)
 
     try:
         if args.train_timesteps > 0:
             print(f"Starting PPO training for {args.train_timesteps} timesteps...")
-            model.learn(total_timesteps=args.train_timesteps, progress_bar=False)
+            
+            # Create the callbacks
+            checkpoint_callback = CheckpointCallback(
+                save_freq=args.save_freq,
+                save_path=os.path.join(artifacts["run_dir"], "checkpoints"),
+                name_prefix="rl_model",
+            )
+            
+            eval_callback = PokeEnvEvalCallback(
+                args=args,
+                eval_freq=args.eval_freq,
+                n_eval_episodes=args.eval_battles,
+                best_model_save_path=os.path.join(artifacts["run_dir"], "best_model"),
+                log_path=artifacts["run_dir"],
+                tracked_env=train_env,
+            )
+
+            model.learn(
+                total_timesteps=args.train_timesteps,
+                callback=[checkpoint_callback, eval_callback],
+                progress_bar=False,
+            )
         else:
             print("Skipping PPO training because train_timesteps=0.")
     finally:
@@ -207,8 +403,15 @@ def main() -> None:
     model.save(artifacts["checkpoint_path"])
     print(f"Saved checkpoint to {artifacts['checkpoint_path']}")
 
+    train_penalty_report = train_env.get_strategic_penalty_report()
+    train_tactical_shaping_report = train_env.get_tactical_shaping_report()
+    train_decision_audit_report = train_env.get_decision_audit_report()
+    print(f"Training strategic penalties: {format_penalty_report(train_penalty_report)}")
+    print(f"Training tactical shaping: {format_tactical_shaping_report(train_tactical_shaping_report)}")
+    print(f"Training decision audit: {format_decision_audit_report(train_decision_audit_report)}")
+
     print(f"Training complete. Starting evaluation over {args.eval_battles} battle(s)...")
-    summary, records = evaluate_policy(model, args)
+    summary, records, eval_decision_audit_report, eval_tactical_shaping_report = evaluate_policy(model, args)
     elapsed = time.perf_counter() - start
 
     payload = {
@@ -224,6 +427,11 @@ def main() -> None:
         "resume_from": args.resume_from,
         "reward_config": REWARD_CONFIG,
         "checkpoint_path": artifacts["checkpoint_path"],
+        "train_penalty_report": train_penalty_report,
+        "train_tactical_shaping_report": train_tactical_shaping_report,
+        "train_decision_audit_report": train_decision_audit_report,
+        "eval_decision_audit_report": eval_decision_audit_report,
+        "eval_tactical_shaping_report": eval_tactical_shaping_report,
         "summary": {
             **asdict(summary),
             "win_rate": (summary.wins / args.eval_battles) if args.eval_battles else 0.0,
@@ -246,6 +454,11 @@ def main() -> None:
     print(f"win_rate: {summary.wins / args.eval_battles:.3f}")
     print(f"avg_reward: {summary.avg_reward:.3f}")
     print(f"avg_steps: {summary.avg_steps:.2f}")
+    print(f"train_penalties: {format_penalty_report(train_penalty_report)}")
+    print(f"train_tactical_shaping: {format_tactical_shaping_report(train_tactical_shaping_report)}")
+    print(f"train_decision_audit: {format_decision_audit_report(train_decision_audit_report)}")
+    print(f"eval_tactical_shaping: {format_tactical_shaping_report(eval_tactical_shaping_report)}")
+    print(f"eval_decision_audit: {format_decision_audit_report(eval_decision_audit_report)}")
     print(f"verify_embedding: {args.verify_embedding}")
     print(f"checkpoint_path: {artifacts['checkpoint_path']}")
     print(f"summary_path: {artifacts['summary_path']}")

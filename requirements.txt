@@ -1,5 +1,5 @@
-numpy==2.4.4
-gymnasium==1.2.3
+numpy>=2.2.0,<2.3.0
+gymnasium>=0.29.1
 poke-env==0.13.0
-stable-baselines3==2.7.1
-torch==2.11.0
+stable-baselines3>=2.3.0
+torch>=2.1.0
