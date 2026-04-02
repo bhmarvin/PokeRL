@@ -8,7 +8,6 @@ The project focuses on:
 - a structured feature extractor that processes semantic blocks (active mons, moves, bench slots, threats) through shared-weight encoders before feeding a [256,128] MLP
 - reward shaping on top of `poke_env`'s state-delta helper with tactical levers
 - masked PPO so the policy never assigns probability mass to illegal actions
-- Welford online observation normalization (running mean/variance saved with model checkpoint)
 - repeatable training, checkpointing, evaluation, and summary output
 
 ## Main Files
@@ -82,11 +81,11 @@ The manual damage calculator (`_manual_damage_calc`) implements the Gen 9 damage
 
 ## Structured Extractor
 
-The `StructuredObservationExtractor` in `policies.py` normalizes the full vector (Welford), then slices into 9 semantic blocks. Each block passes through a small Linear+ReLU encoder. Repeated structures (moves, bench slots) use **shared-weight encoders** -- the same network processes each slot. Output is 561 dims fed to a [256,128] actor-critic MLP. Block sizes auto-derive from `brent_agent.py` constants.
+The `StructuredObservationExtractor` in `policies.py` slices the pre-normalized observation vector into 9 semantic blocks. Each block passes through a small Linear+ReLU encoder. Repeated structures (moves, bench slots) use **shared-weight encoders** -- the same network processes each slot. Output is 561 dims fed to a [256,128] actor-critic MLP. Block sizes auto-derive from `brent_agent.py` constants.
 
 ## Reward Shaping
 
-Core rewards from poke_env: `hp_value=0.5`, `fainted_value=1.0`, `status_value=0.25`, `victory_value=30.0`
+Core rewards from poke_env: `hp_value=0.5`, `fainted_value=1.0`, `status_value=0.25`, `victory_value=15.0`
 
 Tactical levers (penalties/bonuses applied per-decision):
 
@@ -96,12 +95,12 @@ Tactical levers (penalties/bonuses applied per-decision):
 | good_safe_switch | +0.2 | Switching to a mon that resists opponent's STAB |
 | good_tera | +0.5 | Tera grants immunity or enables a KO |
 | head_hunter_bonus | +0.25/teammate | KOing a mon that threatened multiple teammates |
-| unsafe_stay_in | -0.2 | Staying in when outsped for KO with safe switch available |
-| abandon_boosted_mon | -0.1 | Switching out a +2 mon not under pressure |
-| heal_satiation | -0.1 | 3+ consecutive heals on same mon |
-| wasted_free_switch | -0.1 | Switching out immediately after entering via faint (next turn only) |
-| redundant_hazards | -0.1 | Setting hazards already on field |
-| redundant_self_drop | -0.1 | Using self-stat-drop move when better option exists |
+| unsafe_stay_in | -0.1 | Staying in when outsped for KO with safe switch available |
+| abandon_boosted_mon | -0.05 | Switching out a +2 mon not under pressure |
+| heal_satiation | -0.05 | 3+ consecutive heals on same mon |
+| wasted_free_switch | 0.0 | Disabled — bad credit assignment at early training |
+| redundant_hazards | -0.05 | Setting hazards already on field |
+| redundant_self_drop | -0.05 | Using self-stat-drop move when better option exists |
 
 ## Training
 
