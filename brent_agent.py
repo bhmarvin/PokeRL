@@ -49,13 +49,16 @@ REWARD_CONFIG = {
     "bonus_good_attack_selection": 0.0,
     "bonus_good_safe_switch": 0.4,
     "bonus_good_tera": 0.5,
+    "penalty_abandon_boosted_mon": -0.5,
+    "penalty_heal_satiation": -0.5,
+    "penalty_wasted_free_switch": -0.4,
 }
 
 DECISION_AUDIT_SAMPLE_LIMIT = 20
 
-VECTOR_LENGTH = 653
+VECTOR_LENGTH = 658
 MOVE_BLOCK_SIZE = 25
-MY_BENCH_SLOT_SIZE = 52
+MY_BENCH_SLOT_SIZE = 53
 OPP_BENCH_SLOT_SIZE = 20
 BENCH_MOVE_FLAG_SIZE = 8
 OPP_THREAT_ROWS = 4
@@ -218,12 +221,46 @@ def _stab_multiplier(attacker: Pokemon, move_type: PokemonType) -> float:
     return 1.5 if move_type in attacker.types else 1.0
 
 
+# Abilities that grant full immunity to a move type
+_ABILITY_TYPE_IMMUNITIES: dict[str, PokemonType] = {
+    "levitate": PokemonType.GROUND,
+    "voltabsorb": PokemonType.ELECTRIC,
+    "lightningrod": PokemonType.ELECTRIC,
+    "motordrive": PokemonType.ELECTRIC,
+    "waterabsorb": PokemonType.WATER,
+    "stormdrain": PokemonType.WATER,
+    "dryskin": PokemonType.WATER,
+    "flashfire": PokemonType.FIRE,
+    "sapsipper": PokemonType.GRASS,
+    "windrider": PokemonType.FLYING,
+    "eartheater": PokemonType.GROUND,
+}
+
+
+def _ability_immune(defender: Pokemon, move_type: PokemonType) -> bool:
+    """Check if defender's ability grants immunity to the move type."""
+    ability = getattr(defender, "ability", None)
+    if ability is None:
+        # Check possible_abilities for unrevealed mons — if ALL abilities
+        # grant immunity, treat as immune. Otherwise assume not immune.
+        possible = getattr(defender, "possible_abilities", None)
+        if possible and len(possible) > 0:
+            return all(
+                _ABILITY_TYPE_IMMUNITIES.get(a.lower().replace(" ", ""), None) == move_type
+                for a in possible
+            )
+        return False
+    return _ABILITY_TYPE_IMMUNITIES.get(ability.lower().replace(" ", ""), None) == move_type
+
+
 def _defender_type_mult(
     move_type: PokemonType,
     defender: Pokemon,
     type_chart: Any,
 ) -> float:
-    """Type effectiveness accounting for tera (mono-type when tera'd)."""
+    """Type effectiveness accounting for tera (mono-type when tera'd) and ability immunities."""
+    if _ability_immune(defender, move_type):
+        return 0.0
     if getattr(defender, "is_terastallized", False):
         tera_type = getattr(defender, "tera_type", None) or defender.type_1
         return move_type.damage_multiplier(tera_type, None, type_chart=type_chart)
@@ -747,10 +784,13 @@ class BrentObservationVectorBuilder:
             start = MY_BENCH_START + slot * MY_BENCH_SLOT_SIZE
             vector[start] = 0.0 if mon.fainted else 1.0
             vector[start + 1] = _safe_hp_fraction(mon)
-            self._fill_type_one_hot(vector, start + 2, mon.types)
+            self._fill_type_one_hot(vector, start + 2, _effective_types(mon))
             for move_idx, move in enumerate(tuple(mon.moves.values())[:4]):
                 move_start = start + 20 + move_idx * BENCH_MOVE_FLAG_SIZE
                 self._fill_bench_move_flags(vector, move_start, move, battle)
+            # Ability flag: Intimidate
+            ability = getattr(mon, "ability", None)
+            vector[start + 52] = 1.0 if ability and ability.lower().replace(" ", "") == "intimidate" else 0.0
 
     def _fill_bench_move_flags(
         self,
@@ -779,7 +819,7 @@ class BrentObservationVectorBuilder:
             start = OPP_BENCH_START + slot * OPP_BENCH_SLOT_SIZE
             vector[start] = 1.0
             vector[start + 1] = _safe_hp_fraction(mon)
-            self._fill_type_one_hot(vector, start + 2, mon.types)
+            self._fill_type_one_hot(vector, start + 2, _effective_types(mon))
 
     def _fill_targeting_matrix(self, vector: np.ndarray, battle: AbstractBattle) -> None:
         attacker = battle.active_pokemon
@@ -790,7 +830,7 @@ class BrentObservationVectorBuilder:
         my_moves = tuple(battle.available_moves)[:4]
         for move_idx, move in enumerate(my_moves):
             for target_idx, target in enumerate(opponent_bench):
-                if not target.revealed:
+                if not target.revealed or target.fainted:
                     continue
                 min_pct, max_pct = self._damage_range_percent(
                     battle,
@@ -822,7 +862,7 @@ class BrentObservationVectorBuilder:
             vector[row_start] = entry.move_prob
             vector[row_start + 1] = entry.revealed_flag
             for target_idx, target in enumerate(my_team_order):
-                if target is None:
+                if target is None or target.fainted:
                     continue
                 vector[row_start + 2 + target_idx] = self._move_expected_value(
                     battle,
@@ -833,7 +873,7 @@ class BrentObservationVectorBuilder:
                     battle.player_role,
                 )
         for target_idx, target in enumerate(my_team_order):
-            if target is None:
+            if target is None or target.fainted:
                 continue
             vector[OPP_THREAT_OHKO_START + target_idx] = self._estimate_ohko_risk(
                 battle,
@@ -1234,7 +1274,7 @@ class BrentObservationVectorBuilder:
         # Boosts
         a_boost = _stat_stage_multiplier(attacker.boosts.get("atk" if category == MoveCategory.PHYSICAL else "spa", 0))
         d_boost = _stat_stage_multiplier(defender.boosts.get("def" if category == MoveCategory.PHYSICAL else "spd", 0))
-        
+
         a *= a_boost
         d *= d_boost
         
@@ -1642,6 +1682,15 @@ class BrentsRLAgent(SinglesEnv):
         self._decision_audit_samples: Dict[str, list[Dict[str, Any]]] = {}
         self._decision_count = 0
         self._switch_action_count = 0
+        # Track consecutive heals per mon (species → count)
+        self._consecutive_heal_count: Dict[str, int] = {}
+        self._last_action_was_heal: Dict[str, bool] = {}
+        # Track wasted free switches: mon species that entered via forced switch after faint
+        self._entered_after_faint: set[str] = set()
+        self._last_active_species: Optional[str] = None
+        self._last_active_fainted: bool = False
+        # Head-Hunter: track opponent alive mons for faint detection
+        self._prev_opp_alive: set[str] = set()
         self.observation_spaces = {
             agent: Box(
                 low=-1.0,
@@ -1656,7 +1705,55 @@ class BrentsRLAgent(SinglesEnv):
         base_config = {key: REWARD_CONFIG[key] for key in POKE_ENV_REWARD_KEYS}
         reward = self.reward_computing_helper(battle, **base_config)
         shaping = self._consume_tactical_shaping(battle)
-        return reward + shaping
+        head_hunter = self._head_hunter_bonus(battle)
+        return reward + shaping + head_hunter
+
+    def _head_hunter_bonus(self, battle: AbstractBattle) -> float:
+        """Extra reward for KOing high-threat opponent mons.
+        Scales fainted_value by how many of our team the mon threatened to OHKO."""
+        curr_alive = set()
+        for mon in battle.opponent_team.values():
+            if not mon.fainted:
+                curr_alive.add(getattr(mon, "species", str(mon)))
+
+        newly_fainted = self._prev_opp_alive - curr_alive
+        self._prev_opp_alive = curr_alive
+
+        if not newly_fainted:
+            return 0.0
+
+        # For each newly fainted opponent, check how many of our team it threatened
+        bonus = 0.0
+        my_team = [mon for mon in battle.team.values() if not mon.fainted]
+        for fainted_species in newly_fainted:
+            # Find the fainted mon object
+            fainted_mon = None
+            for mon in battle.opponent_team.values():
+                if getattr(mon, "species", None) == fainted_species:
+                    fainted_mon = mon
+                    break
+            if fainted_mon is None or not fainted_mon.moves:
+                continue
+
+            # Count how many of our team this mon could OHKO
+            ohko_count = 0
+            for my_mon in my_team:
+                for opp_move in fainted_mon.moves.values():
+                    try:
+                        _, max_pct = self.vector_builder._damage_range_percent(
+                            battle, fainted_mon, my_mon, opp_move, None, None,
+                        )
+                        if max_pct >= _safe_hp_fraction(my_mon) and max_pct > 0.5:
+                            ohko_count += 1
+                            break
+                    except Exception:
+                        continue
+
+            # Scale bonus: 0 threats = no extra, 1 = +0.25, 2 = +0.5, 3+ = +0.75
+            if ohko_count >= 1:
+                bonus += min(ohko_count * 0.25, 0.75)
+
+        return bonus
 
     def action_to_order(
         self,
@@ -1687,6 +1784,7 @@ class BrentsRLAgent(SinglesEnv):
             self._tactical_reward_context = None
             return
 
+        self._update_action_tracking(battle, action)
         matches = tuple(self._evaluate_tactical_levers(battle, order))
         self._tactical_reward_context = TacticalRewardContext(
             battle_tag=_battle_tag(battle),
@@ -1862,6 +1960,12 @@ class BrentsRLAgent(SinglesEnv):
                 False,
             ),
             (
+                "heal_satiation",
+                "penalty_heal_satiation",
+                self._evaluate_heal_satiation(battle, move),
+                True,
+            ),
+            (
                 "good_attack_selection",
                 "bonus_good_attack_selection",
                 self._evaluate_good_attack_selection(battle, move),
@@ -1883,12 +1987,31 @@ class BrentsRLAgent(SinglesEnv):
         battle: AbstractBattle,
         switch_target: Pokemon,
     ) -> list[TacticalLeverMatch]:
-        match = self._make_tactical_match(
-            "good_safe_switch",
-            "bonus_good_safe_switch",
-            self._evaluate_good_safe_switch(battle, switch_target),
-        )
-        return [match] if match is not None else []
+        matches: list[TacticalLeverMatch] = []
+        for reason, reward_key, details, record_audit in (
+            (
+                "good_safe_switch",
+                "bonus_good_safe_switch",
+                self._evaluate_good_safe_switch(battle, switch_target),
+                False,
+            ),
+            (
+                "abandon_boosted_mon",
+                "penalty_abandon_boosted_mon",
+                self._evaluate_abandon_boosted_mon(battle),
+                True,
+            ),
+            (
+                "wasted_free_switch",
+                "penalty_wasted_free_switch",
+                self._evaluate_wasted_free_switch(battle),
+                True,
+            ),
+        ):
+            match = self._make_tactical_match(reason, reward_key, details, record_audit=record_audit)
+            if match is not None:
+                matches.append(match)
+        return matches
 
     def _evaluate_good_tera(
         self,
@@ -1952,6 +2075,132 @@ class BrentsRLAgent(SinglesEnv):
                 "enables_ko": enables_ko,
             }
         return None
+
+    def _update_action_tracking(
+        self,
+        battle: AbstractBattle,
+        action: Move | Pokemon,
+    ) -> None:
+        """Update per-battle state for heal-satiation and free-switch tracking."""
+        active = battle.active_pokemon
+        active_species = getattr(active, "species", None) if active else None
+
+        # Detect free switch entry: if last active fainted and current active changed
+        if self._last_active_fainted and active_species and active_species != self._last_active_species:
+            self._entered_after_faint.add(active_species)
+            self._last_active_fainted = False
+
+        # Track consecutive heals per active mon
+        if isinstance(action, Move) and active_species:
+            is_heal = self._move_has_heal(action)
+            if is_heal:
+                self._consecutive_heal_count[active_species] = (
+                    self._consecutive_heal_count.get(active_species, 0) + 1
+                )
+            else:
+                self._consecutive_heal_count[active_species] = 0
+
+        # If switching, reset heal count for the mon being switched out
+        if isinstance(action, Pokemon) and active_species:
+            self._consecutive_heal_count[active_species] = 0
+
+        # Track faint status for next turn's free-switch detection
+        if active:
+            self._last_active_species = active_species
+            self._last_active_fainted = bool(getattr(active, "fainted", False))
+
+    def _evaluate_abandon_boosted_mon(
+        self,
+        battle: AbstractBattle,
+    ) -> Optional[Dict[str, Any]]:
+        """Penalize switching out a pokemon with significant offensive boosts
+        that is not under pressure (high HP and outspeeds opponent)."""
+        active = battle.active_pokemon
+        opponent = battle.opponent_active_pokemon
+        if active is None or opponent is None:
+            return None
+
+        # Check for significant offensive boosts (≥+2 in atk, spa, or spe)
+        atk_boost = active.boosts.get("atk", 0)
+        spa_boost = active.boosts.get("spa", 0)
+        spe_boost = active.boosts.get("spe", 0)
+        max_offensive_boost = max(atk_boost, spa_boost)
+        total_boost = atk_boost + spa_boost + spe_boost
+
+        if max_offensive_boost < 2 and total_boost < 3:
+            return None
+
+        # Check not under pressure: >50% HP
+        hp = _safe_hp_fraction(active)
+        if hp <= 0.5:
+            return None
+
+        # Check outspeeds (not in danger of being revenge-killed)
+        speed_adv = self.vector_builder._speed_advantage(battle)
+        if speed_adv < 0.5:
+            return None
+
+        return {
+            "species": active.species,
+            "atk_boost": atk_boost,
+            "spa_boost": spa_boost,
+            "spe_boost": spe_boost,
+            "hp_fraction": round(hp, 3),
+            "speed_advantage": round(speed_adv, 3),
+        }
+
+    def _evaluate_heal_satiation(
+        self,
+        battle: AbstractBattle,
+        move: Move,
+    ) -> Optional[Dict[str, Any]]:
+        """Penalize using a heal move 3+ times consecutively with the same mon."""
+        if not self._move_has_heal(move):
+            return None
+
+        active = battle.active_pokemon
+        if active is None:
+            return None
+
+        species = getattr(active, "species", None)
+        if species is None:
+            return None
+
+        # Count is updated BEFORE eval, so current count includes this heal
+        count = self._consecutive_heal_count.get(species, 0)
+        if count < 3:
+            return None
+
+        return {
+            "species": species,
+            "consecutive_heals": count,
+            "hp_fraction": round(_safe_hp_fraction(active), 3),
+        }
+
+    def _evaluate_wasted_free_switch(
+        self,
+        battle: AbstractBattle,
+    ) -> Optional[Dict[str, Any]]:
+        """Penalize switching out a mon on its very first turn after entering
+        via forced switch (after a teammate fainted). You should have brought
+        the other mon in directly on the free switch."""
+        active = battle.active_pokemon
+        if active is None:
+            return None
+
+        species = getattr(active, "species", None)
+        if species is None:
+            return None
+
+        if species not in self._entered_after_faint:
+            return None
+
+        # This mon entered after a faint and is now switching out on turn 1
+        self._entered_after_faint.discard(species)
+        return {
+            "species": species,
+            "hp_fraction": round(_safe_hp_fraction(active), 3),
+        }
 
     def _move_has_status(self, move: Move) -> bool:
         try:

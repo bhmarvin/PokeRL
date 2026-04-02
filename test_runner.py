@@ -20,6 +20,7 @@ from brent_agent import (
     MY_ACTIVE_START,
     MY_MOVES_START,
     ON_RECHARGE_INDEX,
+    OPP_ACTIVE_START,
     OPP_BENCH_START,
     OPP_MOVES_VS_ME_START,
     OPP_THREAT_CONFIDENCE_START,
@@ -28,6 +29,7 @@ from brent_agent import (
     OPP_THREAT_START,
     SPEED_ADVANTAGE_INDEX,
     TARGETING_START,
+    TYPE_ORDER,
     TacticalRewardContext,
     VECTOR_LENGTH,
     BrentObservationVectorBuilder,
@@ -135,6 +137,7 @@ class FakeBattle:
     side_conditions: dict = field(default_factory=dict)
     opponent_side_conditions: dict = field(default_factory=dict)
     finished: bool = False
+    can_tera: bool = False
 
 
 class FakeMeta:
@@ -411,6 +414,12 @@ def build_test_agent() -> BrentsRLAgent:
     agent._decision_audit_samples = {}
     agent._decision_count = 0
     agent._switch_action_count = 0
+    agent._consecutive_heal_count = {}
+    agent._last_action_was_heal = {}
+    agent._entered_after_faint = set()
+    agent._last_active_species = None
+    agent._last_active_fainted = False
+    agent._prev_opp_alive = set()
     agent.reward_computing_helper = lambda battle, **kwargs: 0.0
     return agent
 
@@ -504,7 +513,9 @@ def main() -> None:
     wasteful_agent._record_action_choice(wasteful_order)
     wasteful_agent._remember_tactical_reward_context(wasteful_battle, wasteful_order)
     wasteful_reward = wasteful_agent.calc_reward(wasteful_battle)
-    assert np.isclose(wasteful_reward, REWARD_CONFIG["penalty_wasteful_heal_overflow"])
+    # Both wasteful_heal_overflow and unsafe_stay_in fire here
+    expected_wasteful = REWARD_CONFIG["penalty_wasteful_heal_overflow"] + REWARD_CONFIG["penalty_unsafe_stay_in_with_fast_ko_switch"]
+    assert np.isclose(wasteful_reward, expected_wasteful), f"wasteful heal got {wasteful_reward}, expected {expected_wasteful}"
 
     neutral_heal_battle = build_fake_battle()
     neutral_heal_battle.active_pokemon.current_hp_fraction = 0.7
@@ -513,7 +524,8 @@ def main() -> None:
     neutral_heal_agent._record_action_choice(neutral_heal_order)
     neutral_heal_agent._remember_tactical_reward_context(neutral_heal_battle, neutral_heal_order)
     neutral_heal_reward = neutral_heal_agent.calc_reward(neutral_heal_battle)
-    assert np.isclose(neutral_heal_reward, 0.0)
+    # unsafe_stay_in fires here because safe switch exists
+    assert np.isclose(neutral_heal_reward, REWARD_CONFIG["penalty_unsafe_stay_in_with_fast_ko_switch"])
 
     low_hp_heal_battle = build_fake_battle()
     low_hp_heal_battle.active_pokemon.current_hp_fraction = 0.25
@@ -522,7 +534,8 @@ def main() -> None:
     low_hp_heal_agent._record_action_choice(low_hp_heal_order)
     low_hp_heal_agent._remember_tactical_reward_context(low_hp_heal_battle, low_hp_heal_order)
     low_hp_heal_reward = low_hp_heal_agent.calc_reward(low_hp_heal_battle)
-    assert np.isclose(low_hp_heal_reward, REWARD_CONFIG["bonus_good_heal_timing"])
+    expected_low_hp = REWARD_CONFIG["bonus_good_heal_timing"] + REWARD_CONFIG["penalty_unsafe_stay_in_with_fast_ko_switch"]
+    assert np.isclose(low_hp_heal_reward, expected_low_hp), f"low hp heal got {low_hp_heal_reward}"
 
     self_drop_battle = build_fake_battle()
     self_drop_battle.active_pokemon.boosts["spa"] = -3
@@ -531,7 +544,8 @@ def main() -> None:
     self_drop_agent._record_action_choice(self_drop_order)
     self_drop_agent._remember_tactical_reward_context(self_drop_battle, self_drop_order)
     self_drop_reward = self_drop_agent.calc_reward(self_drop_battle)
-    assert np.isclose(self_drop_reward, REWARD_CONFIG["penalty_redundant_self_drop_move"])
+    expected_self_drop = REWARD_CONFIG["penalty_redundant_self_drop_move"] + REWARD_CONFIG["penalty_unsafe_stay_in_with_fast_ko_switch"]
+    assert np.isclose(self_drop_reward, expected_self_drop), f"self drop got {self_drop_reward}"
 
     fresh_overheat_battle = build_fake_battle()
     fresh_overheat_agent = build_test_agent()
@@ -539,7 +553,7 @@ def main() -> None:
     fresh_overheat_agent._record_action_choice(fresh_overheat_order)
     fresh_overheat_agent._remember_tactical_reward_context(fresh_overheat_battle, fresh_overheat_order)
     fresh_overheat_reward = fresh_overheat_agent.calc_reward(fresh_overheat_battle)
-    assert np.isclose(fresh_overheat_reward, 0.0)
+    assert np.isclose(fresh_overheat_reward, REWARD_CONFIG["penalty_unsafe_stay_in_with_fast_ko_switch"])
 
     attack_battle = build_fake_battle()
     attack_agent = build_test_agent()
@@ -547,7 +561,8 @@ def main() -> None:
     attack_agent._record_action_choice(attack_order)
     attack_agent._remember_tactical_reward_context(attack_battle, attack_order)
     attack_reward = attack_agent.calc_reward(attack_battle)
-    assert np.isclose(attack_reward, REWARD_CONFIG["bonus_good_attack_selection"])
+    # good_attack_selection is zeroed out, hyperbeam KOs so unsafe_stay doesn't fire
+    assert np.isclose(attack_reward, 0.0), f"expected 0 reward, got {attack_reward}"
 
     low_quality_attack_battle = build_fake_battle()
     low_quality_attack_agent = build_test_agent()
@@ -555,7 +570,7 @@ def main() -> None:
     low_quality_attack_agent._record_action_choice(low_quality_attack_order)
     low_quality_attack_agent._remember_tactical_reward_context(low_quality_attack_battle, low_quality_attack_order)
     low_quality_attack_reward = low_quality_attack_agent.calc_reward(low_quality_attack_battle)
-    assert np.isclose(low_quality_attack_reward, 0.0)
+    assert np.isclose(low_quality_attack_reward, REWARD_CONFIG["penalty_unsafe_stay_in_with_fast_ko_switch"])
 
     safe_switch_battle = build_fake_battle()
     safe_switch_agent = build_test_agent()
@@ -593,7 +608,7 @@ def main() -> None:
     unsafe_stay_agent._record_action_choice(unsafe_stay_order)
     unsafe_stay_agent._remember_tactical_reward_context(unsafe_stay_battle, unsafe_stay_order)
     unsafe_stay_reward = unsafe_stay_agent.calc_reward(unsafe_stay_battle)
-    assert np.isclose(unsafe_stay_reward, 0.0)
+    assert np.isclose(unsafe_stay_reward, REWARD_CONFIG["penalty_unsafe_stay_in_with_fast_ko_switch"])
     unsafe_stay_report = unsafe_stay_agent.get_decision_audit_report()
     assert unsafe_stay_report["counts"]["unsafe_stay_in_with_fast_ko_switch"] == 1
 
@@ -625,6 +640,160 @@ def main() -> None:
     )
     assert immune_min == 0.0
     assert immune_max == 0.0
+
+    # ── Tera observation tests ──────────────────────────────────────
+    tera_battle = build_fake_battle()
+    tera_battle.can_tera = True
+    tera_battle.active_pokemon.tera_type = PokemonType.FAIRY
+    tera_vec = builder.embed_battle(tera_battle)
+
+    # My active: is_terastallized=0, can_tera=1, tera_type=FAIRY one-hot
+    assert tera_vec[MY_ACTIVE_START + 40] == np.float32(0.0), "should not be terastallized yet"
+    assert tera_vec[MY_ACTIVE_START + 41] == np.float32(1.0), "can_tera should be 1"
+    fairy_idx = list(TYPE_ORDER).index(PokemonType.FAIRY)
+    assert tera_vec[MY_ACTIVE_START + 42 + fairy_idx] == np.float32(1.0), "tera type fairy should be 1"
+    # Other tera type slots should be 0
+    for i, t in enumerate(TYPE_ORDER):
+        if t != PokemonType.FAIRY:
+            assert tera_vec[MY_ACTIVE_START + 42 + i] == np.float32(0.0), f"tera type {t.name} should be 0"
+
+    # Now terastallize and verify type one-hot changes to mono Fairy
+    tera_battle2 = build_fake_battle()
+    tera_battle2.active_pokemon.is_terastallized = True
+    tera_battle2.active_pokemon.tera_type = PokemonType.FAIRY
+    tera_vec2 = builder.embed_battle(tera_battle2)
+
+    assert tera_vec2[MY_ACTIVE_START + 40] == np.float32(1.0), "should be terastallized"
+    # Type one-hot should now be FAIRY only (mono-type)
+    for i, t in enumerate(TYPE_ORDER):
+        expected = 1.0 if t == PokemonType.FAIRY else 0.0
+        assert tera_vec2[MY_ACTIVE_START + 1 + i] == np.float32(expected), \
+            f"post-tera type {t.name} should be {expected}"
+
+    # Opponent tera: is_terastallized flag
+    opp_tera_battle = build_fake_battle()
+    assert tera_vec[OPP_ACTIVE_START + 40] == np.float32(0.0), "opp not terastallized"
+    opp_tera_battle.opponent_active_pokemon.is_terastallized = True
+    opp_tera_battle.opponent_active_pokemon.tera_type = PokemonType.STEEL
+    opp_tera_vec = builder.embed_battle(opp_tera_battle)
+    assert opp_tera_vec[OPP_ACTIVE_START + 40] == np.float32(1.0), "opp terastallized"
+    # Opp type one-hot should be mono STEEL
+    steel_idx = list(TYPE_ORDER).index(PokemonType.STEEL)
+    for i, t in enumerate(TYPE_ORDER):
+        expected = 1.0 if t == PokemonType.STEEL else 0.0
+        assert opp_tera_vec[OPP_ACTIVE_START + 1 + i] == np.float32(expected), \
+            f"opp post-tera type {t.name} should be {expected}"
+
+    print("  Tera observation tests passed.")
+
+    # ── Tera reward: immunity test ───────────────────────────────
+    # Scenario: Dragonite (Dragon/Flying) with tera_type=Fairy
+    # Opponent Garchomp just used Dragon Pulse (Dragon type)
+    # Tera to Fairy = immune to Dragon. Should trigger good_tera.
+    tera_reward_battle = build_fake_battle()
+    tera_reward_battle.can_tera = True
+    tera_reward_battle.active_pokemon.tera_type = PokemonType.FAIRY
+    dragonpulse = FakeMove(
+        id="dragonpulse", accuracy=1.0,
+        category=MoveCategory.SPECIAL, type=PokemonType.DRAGON,
+    )
+    tera_reward_battle.opponent_active_pokemon.last_move = dragonpulse
+
+    tera_agent = build_test_agent()
+    # Simulate choosing doubleedge + terastallize
+    tera_order = FakeOrder(order=Move("doubleedge", 9), terastallize=True)
+    tera_agent._record_action_choice(tera_order)
+    tera_agent._remember_tactical_reward_context(tera_reward_battle, tera_order)
+    tera_ctx = tera_agent._tactical_reward_context
+    tera_reasons = {m.reason: m.reward for m in tera_ctx.matches}
+    assert "good_tera" in tera_reasons, f"good_tera not found in {tera_reasons}"
+    assert np.isclose(tera_reasons["good_tera"], REWARD_CONFIG["bonus_good_tera"]), \
+        f"immunity tera bonus wrong: {tera_reasons['good_tera']}"
+    tera_agent.calc_reward(tera_reward_battle)  # consume context
+    print("  Tera immunity reward test passed.")
+
+    # ── Tera reward: NO immunity (bad tera) ──────────────────────
+    # Same setup but tera to Steel — not immune to Dragon
+    bad_tera_battle = build_fake_battle()
+    bad_tera_battle.can_tera = True
+    bad_tera_battle.active_pokemon.tera_type = PokemonType.STEEL
+    bad_tera_battle.opponent_active_pokemon.last_move = dragonpulse
+
+    bad_tera_agent = build_test_agent()
+    bad_tera_order = FakeOrder(order=Move("doubleedge", 9), terastallize=True)
+    bad_tera_agent._record_action_choice(bad_tera_order)
+    bad_tera_agent._remember_tactical_reward_context(bad_tera_battle, bad_tera_order)
+    bad_tera_ctx = bad_tera_agent._tactical_reward_context
+    bad_tera_reasons = {m.reason: m.reward for m in bad_tera_ctx.matches}
+    assert "good_tera" not in bad_tera_reasons, \
+        f"steel tera vs dragon should NOT trigger good_tera, got {bad_tera_reasons}"
+    bad_tera_agent.calc_reward(bad_tera_battle)  # consume context
+    print("  Bad tera (no reward) test passed.")
+
+    # ── Tera damage calc: STAB and type effectiveness ────────────
+    from brent_agent import _stab_multiplier, _defender_type_mult, _effective_types
+    from poke_env.data import GenData
+
+    gen_data = GenData.from_gen(9)
+
+    # Tera'd Dragonite (tera Fairy) using Fairy move = 2.0x? No, Fairy not in original types
+    # Original types: Dragon/Flying. Tera type: Fairy.
+    # Using Fairy move: tera_stab=True, original_stab=False → 1.5x
+    fake_tera_mon = FakePokemon(
+        name="TeraTest", species="dragonite",
+        types=(PokemonType.DRAGON, PokemonType.FLYING),
+        current_hp_fraction=1.0,
+        is_terastallized=True, tera_type=PokemonType.FAIRY,
+    )
+    assert _stab_multiplier(fake_tera_mon, PokemonType.FAIRY) == 1.5, "new STAB from tera"
+    assert _stab_multiplier(fake_tera_mon, PokemonType.DRAGON) == 1.5, "original STAB retained"
+    assert _stab_multiplier(fake_tera_mon, PokemonType.FIRE) == 1.0, "no STAB"
+
+    # Tera'd Charizard (Fire/Flying, tera Fire) using Fire move = 2.0x (adaptability)
+    fake_adapt_mon = FakePokemon(
+        name="AdaptTest", species="charizard",
+        types=(PokemonType.FIRE, PokemonType.FLYING),
+        current_hp_fraction=1.0,
+        is_terastallized=True, tera_type=PokemonType.FIRE,
+    )
+    assert _stab_multiplier(fake_adapt_mon, PokemonType.FIRE) == 2.0, "adaptability STAB"
+    assert _stab_multiplier(fake_adapt_mon, PokemonType.FLYING) == 1.5, "original type retained"
+
+    # Effective types: tera'd = mono-type
+    assert _effective_types(fake_tera_mon) == (PokemonType.FAIRY,)
+    assert _effective_types(fake_adapt_mon) == (PokemonType.FIRE,)
+
+    # Non-tera'd = original types
+    normal_mon = FakePokemon(
+        name="Normal", species="dragonite",
+        types=(PokemonType.DRAGON, PokemonType.FLYING),
+        current_hp_fraction=1.0,
+    )
+    assert _effective_types(normal_mon) == (PokemonType.DRAGON, PokemonType.FLYING)
+    assert _stab_multiplier(normal_mon, PokemonType.DRAGON) == 1.5
+    assert _stab_multiplier(normal_mon, PokemonType.FIRE) == 1.0
+
+    # Defender type mult: tera'd Garchomp (tera Steel) hit by Fire = 2x (not 1x from Dragon/Ground)
+    tera_defender = FakePokemon(
+        name="TeraDefender", species="garchomp",
+        types=(PokemonType.DRAGON, PokemonType.GROUND),
+        current_hp_fraction=1.0,
+        is_terastallized=True, tera_type=PokemonType.STEEL,
+    )
+    fire_mult = _defender_type_mult(PokemonType.FIRE, tera_defender, gen_data.type_chart)
+    assert fire_mult == 2.0, f"Fire vs tera-Steel should be 2x, got {fire_mult}"
+
+    # Dragon vs tera-Fairy = immune
+    fairy_defender = FakePokemon(
+        name="FairyDef", species="dragonite",
+        types=(PokemonType.DRAGON, PokemonType.FLYING),
+        current_hp_fraction=1.0,
+        is_terastallized=True, tera_type=PokemonType.FAIRY,
+    )
+    dragon_mult = _defender_type_mult(PokemonType.DRAGON, fairy_defender, gen_data.type_chart)
+    assert dragon_mult == 0.0, f"Dragon vs tera-Fairy should be immune, got {dragon_mult}"
+
+    print("  Tera damage calc tests passed.")
 
     print("Observation vector smoke test passed.")
 
