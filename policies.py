@@ -62,8 +62,8 @@ class StructuredObservationExtractor(BaseFeaturesExtractor):
     _MY_ACTIVE_OUT = 64
     _OPP_ACTIVE_OUT = 48
     _SPEED_OUT = 1  # passthrough
-    _MOVE_OUT = 32  # per move, ×4 = 128
-    _MY_BENCH_OUT = 32  # per slot, ×5 = 160
+    _MOVE_OUT = 48  # per move, ×4 = 192
+    _MY_BENCH_OUT = 48  # per slot, ×5 = 240
     _OPP_BENCH_OUT = 16  # per slot, ×5 = 80
     _TARGETING_OUT = 16
     _THREAT_OUT = 32
@@ -72,7 +72,7 @@ class StructuredObservationExtractor(BaseFeaturesExtractor):
         _GLOBAL_OUT + _MY_ACTIVE_OUT + _OPP_ACTIVE_OUT + _SPEED_OUT
         + _MOVE_OUT * 4 + _MY_BENCH_OUT * 5 + _OPP_BENCH_OUT * 5
         + _TARGETING_OUT + _THREAT_OUT
-    )  # = 561
+    )  # = 705
 
     def __init__(self, observation_space: Any):
         super().__init__(observation_space, features_dim=self.FEATURES_DIM)
@@ -102,7 +102,7 @@ class StructuredObservationExtractor(BaseFeaturesExtractor):
             start = MY_MOVES_START + i * MOVE_BLOCK_SIZE
             end = start + MOVE_BLOCK_SIZE
             move_embeds.append(self.move_enc(x[:, start:end]))
-        moves_f = th.cat(move_embeds, dim=1)  # (batch, 128)
+        moves_f = th.cat(move_embeds, dim=1)  # (batch, 192)
 
         # Shared my-bench encoder: 5 slots × MY_BENCH_SLOT_SIZE features each
         my_bench_embeds = []
@@ -110,7 +110,7 @@ class StructuredObservationExtractor(BaseFeaturesExtractor):
             start = MY_BENCH_START + i * MY_BENCH_SLOT_SIZE
             end = start + MY_BENCH_SLOT_SIZE
             my_bench_embeds.append(self.my_bench_enc(x[:, start:end]))
-        my_bench_f = th.cat(my_bench_embeds, dim=1)  # (batch, 160)
+        my_bench_f = th.cat(my_bench_embeds, dim=1)  # (batch, 240)
 
         # Shared opp-bench encoder: 5 slots × 20 features each
         opp_bench_embeds = []
@@ -127,7 +127,7 @@ class StructuredObservationExtractor(BaseFeaturesExtractor):
             global_f, my_act_f, opp_act_f, speed_f,
             moves_f, my_bench_f, opp_bench_f,
             target_f, threat_f,
-        ], dim=1)  # (batch, 561)
+        ], dim=1)  # (batch, 705)
 
 
 class MaskedActorCriticPolicy(ActorCriticPolicy):
@@ -135,7 +135,7 @@ class MaskedActorCriticPolicy(ActorCriticPolicy):
         super().__init__(
             *args,
             **kwargs,
-            net_arch=[256, 128],
+            net_arch=[512, 256, 128],
             features_extractor_class=StructuredObservationExtractor,
         )
         self._mask: th.Tensor | None = None
