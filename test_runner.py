@@ -414,6 +414,12 @@ def build_test_agent() -> BrentsRLAgent:
     agent._decision_audit_samples = {}
     agent._decision_count = 0
     agent._switch_action_count = 0
+    agent._consecutive_heal_count = {}
+    agent._last_action_was_heal = {}
+    agent._entered_after_faint = set()
+    agent._last_active_species = None
+    agent._last_active_fainted = False
+    agent._prev_opp_alive = set()
     agent.reward_computing_helper = lambda battle, **kwargs: 0.0
     return agent
 
