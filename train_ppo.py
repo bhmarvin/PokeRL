@@ -134,6 +134,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume-from")
     parser.add_argument("--save-freq", type=int, default=50000, help="Save checkpoint every X steps")
     parser.add_argument("--eval-freq", type=int, default=10000, help="Evaluate every X steps")
+    parser.add_argument("--learning-rate", type=float, default=3e-4,
+                        help="PPO learning rate (default 3e-4, lower for curriculum transitions)")
     return parser.parse_args()
 
 
@@ -334,7 +336,20 @@ class PokeEnvEvalCallback(BaseCallback):
         eval_tactical_shaping_report: dict[str, Any] = {}
         try:
             for ep in range(self.n_eval_episodes):
-                obs, _ = env.reset()
+                for _retry in range(3):
+                    try:
+                        obs, _ = env.reset()
+                        break
+                    except OSError:
+                        time.sleep(0.5)
+                        try:
+                            env.close()
+                        except OSError:
+                            pass
+                        env = create_wrapped_env(self.args, self.args.eval_opponent)
+                else:
+                    print(f"  [eval] skipping episode {ep} — could not reset env")
+                    continue
                 done, total_reward = False, 0.0
                 episode_steps = 0
                 while not done:
@@ -388,12 +403,18 @@ class PokeEnvEvalCallback(BaseCallback):
 def build_model(args: argparse.Namespace, env: Monitor) -> PPO:
     if args.resume_from:
         print(f"Loading PPO checkpoint from {args.resume_from}")
-        return PPO.load(args.resume_from, env=env, device=args.device, tensorboard_log=os.path.join(args.output_dir, "logs"))
+        model = PPO.load(
+            args.resume_from, env=env, device=args.device,
+            tensorboard_log=os.path.join(args.output_dir, "logs"),
+            custom_objects={"learning_rate": args.learning_rate},
+        )
+        print(f"  learning_rate overridden to {args.learning_rate}")
+        return model
 
     return PPO(
         MaskedActorCriticPolicy,
         env,
-        learning_rate=3e-4,
+        learning_rate=args.learning_rate,
         n_steps=2048,
         batch_size=128,
         gamma=0.99,

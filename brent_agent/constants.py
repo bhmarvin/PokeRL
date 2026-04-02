@@ -1,0 +1,317 @@
+"""Constants, orderings, helper functions, and dataclasses for the PokeRL observation vector."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple
+
+from poke_env.battle.effect import Effect
+from poke_env.battle.field import Field
+from poke_env.battle.move import Move
+from poke_env.battle.move_category import MoveCategory
+from poke_env.battle.pokemon import Pokemon
+from poke_env.battle.pokemon_type import PokemonType
+from poke_env.battle.side_condition import SideCondition
+from poke_env.battle.status import Status
+from poke_env.battle.weather import Weather
+
+# ---------------------------------------------------------------------------
+# Reward configuration
+# ---------------------------------------------------------------------------
+
+POKE_ENV_REWARD_KEYS = (
+    "fainted_value",
+    "hp_value",
+    "status_value",
+    "victory_value",
+)
+
+REWARD_CONFIG = {
+    "fainted_value": 1.0,
+    "hp_value": 0.5,
+    "status_value": 0.25,
+    "victory_value": 5.0,
+    "penalty_redundant_stealthrock": -0.1,
+    "penalty_redundant_stickyweb": -0.1,
+    "penalty_redundant_spikes": -0.1,
+    "penalty_redundant_status": -0.1,
+    "penalty_bad_encore": -0.1,
+    "penalty_ineffective_heal": -0.1,
+    "penalty_wasteful_heal_overflow": -0.05,
+    "penalty_redundant_self_drop_move": -0.1,
+    "penalty_unsafe_stay_in_with_fast_ko_switch": -0.2,
+    "bonus_good_heal_timing": 0.2,
+    "bonus_good_attack_selection": 0.0,
+    "bonus_good_safe_switch": 0.2,
+    "bonus_good_tera": 0.5,
+    "penalty_abandon_boosted_mon": -0.1,
+    "penalty_heal_satiation": -0.1,
+    "penalty_wasted_free_switch": -0.1,
+}
+
+DECISION_AUDIT_SAMPLE_LIMIT = 20
+
+# ---------------------------------------------------------------------------
+# Observation vector layout
+# ---------------------------------------------------------------------------
+
+MOVE_BLOCK_SIZE = 37  # 25 base + 5 status-move + 6 volatile/secondary + 1 multi-hit flag
+MY_BENCH_SLOT_SIZE = 63  # 53 base + 5 matchup + 5 status (psn_sev, par, brn, slp, frz)
+OPP_BENCH_SLOT_SIZE = 20
+BENCH_MOVE_FLAG_SIZE = 8
+OPP_THREAT_ROWS = 4
+OPP_THREAT_ROW_SIZE = 8
+MY_ACTIVE_BLOCK_SIZE = 60
+OPP_ACTIVE_BLOCK_SIZE = 41
+
+TURN_INDEX = 0
+WEATHER_START = 1
+TERRAIN_START = 5
+TRICK_ROOM_INDEX = 9
+MY_SIDE_START = 10
+OPP_SIDE_START = 17
+MY_ACTIVE_START = 24
+OPP_ACTIVE_START = MY_ACTIVE_START + MY_ACTIVE_BLOCK_SIZE  # 84
+SPEED_ADVANTAGE_INDEX = OPP_ACTIVE_START + OPP_ACTIVE_BLOCK_SIZE  # 125
+MY_MOVES_START = SPEED_ADVANTAGE_INDEX + 1  # 126
+MY_BENCH_START = MY_MOVES_START + 4 * MOVE_BLOCK_SIZE  # 274
+OPP_BENCH_START = MY_BENCH_START + 5 * MY_BENCH_SLOT_SIZE  # 589
+TARGETING_START = OPP_BENCH_START + 5 * OPP_BENCH_SLOT_SIZE  # 689
+MY_TEAM_REVEALED_START = TARGETING_START + 20  # 709
+OPP_THREAT_START = MY_TEAM_REVEALED_START + 6  # 715
+OPP_MOVES_VS_ME_START = OPP_THREAT_START + 2
+OPP_THREAT_OHKO_START = OPP_THREAT_START + OPP_THREAT_ROWS * OPP_THREAT_ROW_SIZE
+OPP_THREAT_CONFIDENCE_START = OPP_THREAT_OHKO_START + 6
+ON_RECHARGE_INDEX = OPP_THREAT_CONFIDENCE_START + 2
+ALIVE_DIFF_INDEX = ON_RECHARGE_INDEX + 1
+FORCE_SWITCH_INDEX = ALIVE_DIFF_INDEX + 1
+VECTOR_LENGTH = FORCE_SWITCH_INDEX + 1
+
+# ---------------------------------------------------------------------------
+# Canonical orderings for one-hot encoding
+# ---------------------------------------------------------------------------
+
+TYPE_ORDER = (
+    PokemonType.BUG, PokemonType.DARK, PokemonType.DRAGON, PokemonType.ELECTRIC,
+    PokemonType.FAIRY, PokemonType.FIGHTING, PokemonType.FIRE, PokemonType.FLYING,
+    PokemonType.GHOST, PokemonType.GRASS, PokemonType.GROUND, PokemonType.ICE,
+    PokemonType.NORMAL, PokemonType.POISON, PokemonType.PSYCHIC, PokemonType.ROCK,
+    PokemonType.STEEL, PokemonType.WATER,
+)
+
+WEATHER_ORDER = (Weather.RAINDANCE, Weather.SUNNYDAY, Weather.SANDSTORM, Weather.SNOW)
+TERRAIN_ORDER = (Field.ELECTRIC_TERRAIN, Field.GRASSY_TERRAIN, Field.PSYCHIC_TERRAIN, Field.MISTY_TERRAIN)
+BOOST_ORDER = ("atk", "def", "spa", "spd", "spe", "evasion", "accuracy")
+STATUS_ORDER = (Status.BRN, Status.PAR, Status.SLP, Status.FRZ)
+
+VOLATILE_ORDER = (Effect.SUBSTITUTE, Effect.TAUNT, Effect.ENCORE, Effect.CONFUSION)
+
+SIDE_CONDITION_ORDER = (
+    SideCondition.STEALTH_ROCK, SideCondition.SPIKES, SideCondition.TOXIC_SPIKES,
+    SideCondition.STICKY_WEB, SideCondition.REFLECT, SideCondition.LIGHT_SCREEN,
+    SideCondition.AURORA_VEIL,
+)
+
+# ---------------------------------------------------------------------------
+# Move / item category sets
+# ---------------------------------------------------------------------------
+
+PIVOT_MOVES = {"uturn", "voltswitch", "flipturn", "teleport"}
+WEATHER_HEAL_MOVES = {"synthesis", "moonlight", "morningsun"}
+RECOVERY_ITEMS = {"leftovers", "blacksludge", "shellbell", "sitrusberry", "oranberry"}
+DAMAGE_BOOST_ITEMS = {
+    "choiceband", "choicespecs", "lifeorb", "expertbelt", "muscleband",
+    "wiseglasses", "lightball", "thickclub", "adamantorb", "lustrousorb", "griseousorb",
+}
+SPEED_BOOST_ITEMS = {"choicescarf"}
+SPEED_DROP_ITEMS = {
+    "ironball", "machobrace", "poweranklet", "powerband",
+    "powerbelt", "powerbracer", "powerlens", "powerweight",
+}
+
+# Abilities that grant full immunity to a move type
+ABILITY_TYPE_IMMUNITIES: dict[str, PokemonType] = {
+    "levitate": PokemonType.GROUND,
+    "voltabsorb": PokemonType.ELECTRIC,
+    "lightningrod": PokemonType.ELECTRIC,
+    "motordrive": PokemonType.ELECTRIC,
+    "waterabsorb": PokemonType.WATER,
+    "stormdrain": PokemonType.WATER,
+    "dryskin": PokemonType.WATER,
+    "flashfire": PokemonType.FIRE,
+    "sapsipper": PokemonType.GRASS,
+    "windrider": PokemonType.FLYING,
+    "eartheater": PokemonType.GROUND,
+}
+
+# -ate abilities: Normal moves become the mapped type (+ 1.2x BP in damage calc)
+ATE_ABILITIES: dict[str, PokemonType] = {
+    "pixilate": PokemonType.FAIRY,
+    "aerilate": PokemonType.FLYING,
+    "refrigerate": PokemonType.ICE,
+    "galvanize": PokemonType.ELECTRIC,
+}
+
+# ---------------------------------------------------------------------------
+# Pure helper functions
+# ---------------------------------------------------------------------------
+
+
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def clamp01(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def stat_stage_multiplier(stage: int) -> float:
+    if stage >= 0:
+        return (2.0 + stage) / 2.0
+    return 2.0 / (2.0 - stage)
+
+
+def safe_hp_fraction(mon: Optional[Pokemon]) -> float:
+    if mon is None:
+        return 0.0
+    return clamp01(float(getattr(mon, "current_hp_fraction", 0.0) or 0.0))
+
+
+def effective_types(mon: Pokemon) -> tuple[PokemonType, ...]:
+    """Effective types accounting for terastallization (tera'd mons become mono-type)."""
+    if getattr(mon, "is_terastallized", False):
+        tera_type = getattr(mon, "tera_type", None) or getattr(mon, "type_1", None)
+        if tera_type is not None:
+            return (tera_type,)
+    return mon.types
+
+
+def stab_multiplier(attacker: Pokemon, move_type: PokemonType) -> float:
+    """STAB multiplier with Gen 9 tera mechanics.
+    Tera'd mons get STAB from original types AND tera type.
+    If tera type matches an original type, STAB is 2.0x (adaptability-like)."""
+    if getattr(attacker, "is_terastallized", False):
+        tera_type = getattr(attacker, "tera_type", None)
+        original_types = attacker.types
+        if tera_type is not None:
+            tera_stab = move_type == tera_type
+            original_stab = move_type in original_types
+            if tera_stab and original_stab:
+                return 2.0
+            if tera_stab or original_stab:
+                return 1.5
+            return 1.0
+    return 1.5 if move_type in attacker.types else 1.0
+
+
+def ability_immune(defender: Pokemon, move_type: PokemonType) -> bool:
+    """Check if defender's ability grants immunity to the move type."""
+    ability = getattr(defender, "ability", None)
+    if ability is None:
+        possible = getattr(defender, "possible_abilities", None)
+        if possible and len(possible) > 0:
+            return all(
+                ABILITY_TYPE_IMMUNITIES.get(a.lower().replace(" ", ""), None) == move_type
+                for a in possible
+            )
+        return False
+    return ABILITY_TYPE_IMMUNITIES.get(ability.lower().replace(" ", ""), None) == move_type
+
+
+def defender_type_mult(
+    move_type: PokemonType,
+    defender: Pokemon,
+    type_chart: Any,
+) -> float:
+    """Type effectiveness accounting for tera (mono-type) and ability immunities."""
+    if ability_immune(defender, move_type):
+        return 0.0
+    if getattr(defender, "is_terastallized", False):
+        tera_type = getattr(defender, "tera_type", None) or defender.type_1
+        return move_type.damage_multiplier(tera_type, None, type_chart=type_chart)
+    return move_type.damage_multiplier(defender.type_1, defender.type_2, type_chart=type_chart)
+
+
+def normalize_ability(mon: Pokemon) -> str:
+    """Return ability name as lowercase no-space string, or empty string."""
+    return (getattr(mon, "ability", None) or "").lower().replace(" ", "")
+
+
+def safe_identifier(mon: Optional[Pokemon], role: Optional[str]) -> Optional[str]:
+    if mon is None or role is None:
+        return None
+    try:
+        return mon.identifier(role)
+    except Exception:
+        return None
+
+
+def battle_tag(battle: Any) -> str:
+    return getattr(battle, "battle_tag", "default")
+
+
+def mon_key(mon: Pokemon) -> str:
+    name = getattr(mon, "name", "") or ""
+    species = getattr(mon, "species", "") or ""
+    return f"{name}:{species}"
+
+
+def poison_severity(status: Optional[Status]) -> float:
+    if status == Status.TOX:
+        return 1.0
+    if status == Status.PSN:
+        return 0.5
+    return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Dataclasses
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class OpponentThreatEntry:
+    move: Move
+    move_prob: float
+    revealed_flag: float
+
+
+@dataclass(frozen=True)
+class ThreatAssessment:
+    posterior: Dict[str, float]
+    threat_entries: Tuple[OpponentThreatEntry, ...]
+    active_max_threat: float
+    active_ohko_risk: float
+    active_speed: float | None
+    opponent_speed: float | None
+
+
+@dataclass(frozen=True)
+class TacticalLeverMatch:
+    reason: str
+    reward: float
+    details: Dict[str, Any]
+    record_audit: bool = False
+
+
+@dataclass
+class TacticalRewardContext:
+    battle_tag: str
+    action: Move | Pokemon | None
+    matches: Tuple[TacticalLeverMatch, ...]
+
+
+# ---------------------------------------------------------------------------
+# Layout integrity assertions (run at import time)
+# ---------------------------------------------------------------------------
+
+assert MY_MOVES_START + 4 * MOVE_BLOCK_SIZE == MY_BENCH_START
+assert MY_BENCH_START + 5 * MY_BENCH_SLOT_SIZE == OPP_BENCH_START
+assert OPP_BENCH_START + 5 * OPP_BENCH_SLOT_SIZE == TARGETING_START
+assert TARGETING_START + 20 == MY_TEAM_REVEALED_START
+assert MY_TEAM_REVEALED_START + 6 == OPP_THREAT_START
+assert OPP_THREAT_START + OPP_THREAT_ROWS * OPP_THREAT_ROW_SIZE == OPP_THREAT_OHKO_START
+assert OPP_THREAT_OHKO_START + 6 == OPP_THREAT_CONFIDENCE_START
+assert OPP_THREAT_CONFIDENCE_START + 2 == ON_RECHARGE_INDEX
+assert ON_RECHARGE_INDEX + 1 == ALIVE_DIFF_INDEX
+assert ALIVE_DIFF_INDEX + 1 == FORCE_SWITCH_INDEX
+assert FORCE_SWITCH_INDEX + 1 == VECTOR_LENGTH

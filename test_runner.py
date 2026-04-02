@@ -34,6 +34,7 @@ from brent_agent import (
     TacticalRewardContext,
     VECTOR_LENGTH,
     BrentObservationVectorBuilder,
+    PokemonMechanics,
 )
 
 
@@ -218,12 +219,13 @@ class FakeMeta:
         return dict(self.role_stats.get(role_name, base_stats))
 
 
-class DeterministicBuilder(BrentObservationVectorBuilder):
+class DeterministicMechanics(PokemonMechanics):
+    """PokemonMechanics subclass with deterministic damage for tests."""
     def __init__(self) -> None:
         super().__init__()
         self._meta = FakeMeta()
 
-    def _estimate_damage_range(self, battle, attacker, defender, move, attacker_role, defender_role):
+    def estimate_damage_range(self, battle, attacker, defender, move, attacker_role, defender_role):
         targeted_damage_map = {
             ("fireblast", "altaria"): (20.0, 25.0),
             ("flamethrower", "altaria"): (10.0, 15.0),
@@ -248,6 +250,12 @@ class DeterministicBuilder(BrentObservationVectorBuilder):
         if (move.id, defender_species) in targeted_damage_map:
             return targeted_damage_map[(move.id, defender_species)]
         return damage_map.get(move.id, (0.0, 0.0))
+
+
+class DeterministicBuilder(BrentObservationVectorBuilder):
+    def __init__(self) -> None:
+        super().__init__()
+        self.mechanics = DeterministicMechanics()
 
 
 @dataclass
@@ -456,12 +464,12 @@ def main() -> None:
     assert vector[ON_RECHARGE_INDEX] == np.float32(0.0)
     assert np.allclose(vector[OPP_BENCH_START + 20 : TARGETING_START], 0.0)
 
-    posterior = builder._opponent_role_posterior(battle.opponent_active_pokemon)
+    posterior = builder.mechanics.opponent_role_posterior(battle.opponent_active_pokemon)
     assert posterior == {"wallbreaker": 1.0}
-    assert builder._speed_stat_estimate(battle.opponent_active_pokemon, posterior) == 80.0
-    assert builder._speed_item_multiplier(battle.opponent_active_pokemon, posterior) == 1.5
+    assert builder.mechanics._speed_stat_estimate(battle.opponent_active_pokemon, posterior) == 80.0
+    assert builder.mechanics._speed_item_multiplier(battle.opponent_active_pokemon, posterior) == 1.5
 
-    inferred_entries = builder._select_opponent_threat_entries(battle.opponent_active_pokemon, posterior)
+    inferred_entries = builder.mechanics.select_opponent_threat_entries(battle.opponent_active_pokemon, posterior)
     assert [entry.move.id for entry in inferred_entries] == [
         "flamethrower",
         "fireblast",
@@ -485,19 +493,19 @@ def main() -> None:
     assert vector[MY_MOVES_START + 22] == np.float32(0.0)
     assert vector[MY_MOVES_START + 23] == np.float32(0.0)
     assert vector[MY_MOVES_START + 24] == np.float32(0.0)
-    assert builder._move_effect_chance(
+    assert builder.mechanics.move_effect_chance(
         battle.team["p1b"].moves["discharge"],
         statuses=(Status.PAR,),
     ) == np.float32(0.3)
-    assert builder._move_effect_chance(
+    assert builder.mechanics.move_effect_chance(
         battle.team["p1b"].moves["icebeam"],
         statuses=(Status.FRZ,),
     ) == np.float32(0.1)
-    assert builder._move_effect_chance(
+    assert builder.mechanics.move_effect_chance(
         battle.team["p1b"].moves["hurricane"],
         volatile_effect=Effect.CONFUSION,
     ) == np.float32(0.3)
-    assert builder._move_effect_chance(
+    assert builder.mechanics.move_effect_chance(
         battle.opponent_active_pokemon.moves["flamethrower"],
         statuses=(Status.BRN,),
     ) == np.float32(0.1)
@@ -618,7 +626,7 @@ def main() -> None:
     assert unsafe_stay_report["counts"]["unsafe_stay_in_with_fast_ko_switch"] == 1
 
     seismic_toss = Move("seismictoss", 9)
-    toss_min, toss_max = builder._manual_damage_calc(
+    toss_min, toss_max = builder.mechanics.manual_damage_calc(
         battle.active_pokemon,
         battle.opponent_active_pokemon,
         seismic_toss,
@@ -635,7 +643,7 @@ def main() -> None:
         types=(PokemonType.GHOST, PokemonType.POISON),
         current_hp_fraction=1.0,
     )
-    immune_min, immune_max = builder._manual_damage_calc(
+    immune_min, immune_max = builder.mechanics.manual_damage_calc(
         battle.active_pokemon,
         ghost_target,
         seismic_toss,
@@ -821,7 +829,7 @@ def main() -> None:
         def_stats=None,
     ):
         """Helper: run _manual_damage_calc and return (min, max) raw damage."""
-        return dmg_builder._manual_damage_calc(
+        return dmg_builder.mechanics.manual_damage_calc(
             attacker, defender, move, battle,
             att_stats or attacker.stats,
             def_stats or defender.stats,
@@ -1154,30 +1162,30 @@ def main() -> None:
     print("\n-- Move block feature tests ------------------------")
 
     # Test setup move detection
-    assert dmg_builder._move_is_setup(FakeMove("swordsdance", self_boost={"atk": 2})) == 1.0
-    assert dmg_builder._move_is_setup(FakeMove("calmmind", self_boost={"spa": 1, "spd": 1})) == 1.0
-    assert dmg_builder._move_is_setup(FakeMove("tackle")) == 0.0
-    assert dmg_builder._move_is_setup(FakeMove("closecombat", base_power=120, self_boost={"def": -1, "spd": -1})) == 0.0  # net negative
+    assert dmg_builder.mechanics.move_is_setup(FakeMove("swordsdance", self_boost={"atk": 2})) == 1.0
+    assert dmg_builder.mechanics.move_is_setup(FakeMove("calmmind", self_boost={"spa": 1, "spd": 1})) == 1.0
+    assert dmg_builder.mechanics.move_is_setup(FakeMove("tackle")) == 0.0
+    assert dmg_builder.mechanics.move_is_setup(FakeMove("closecombat", base_power=120, self_boost={"def": -1, "spd": -1})) == 0.0  # net negative
     print("  is_setup detection: PASS")
 
     # Test hazard move detection
-    assert dmg_builder._move_is_hazard(FakeMove("stealthrock")) == 1.0
-    assert dmg_builder._move_is_hazard(FakeMove("spikes")) == 1.0
-    assert dmg_builder._move_is_hazard(FakeMove("tackle")) == 0.0
+    assert dmg_builder.mechanics.move_is_hazard(FakeMove("stealthrock")) == 1.0
+    assert dmg_builder.mechanics.move_is_hazard(FakeMove("spikes")) == 1.0
+    assert dmg_builder.mechanics.move_is_hazard(FakeMove("tackle")) == 0.0
     print("  is_hazard detection: PASS")
 
     # Test recovery move detection
-    assert dmg_builder._move_is_recovery(FakeMove("recover", heal=0.5)) == 1.0
-    assert dmg_builder._move_is_recovery(FakeMove("roost", heal=0.5)) == 1.0
-    assert dmg_builder._move_is_recovery(FakeMove("tackle")) == 0.0
-    assert dmg_builder._move_is_recovery(FakeMove("moonlight", heal=0.5)) == 1.0
+    assert dmg_builder.mechanics.move_is_recovery(FakeMove("recover", heal=0.5)) == 1.0
+    assert dmg_builder.mechanics.move_is_recovery(FakeMove("roost", heal=0.5)) == 1.0
+    assert dmg_builder.mechanics.move_is_recovery(FakeMove("tackle")) == 0.0
+    assert dmg_builder.mechanics.move_is_recovery(FakeMove("moonlight", heal=0.5)) == 1.0
     print("  is_recovery detection: PASS")
 
     # Test self_def_delta and self_spd_delta
-    assert dmg_builder._move_self_delta(FakeMove("calmmind", self_boost={"spa": 1, "spd": 1}), "def") == 0.0
-    assert dmg_builder._move_self_delta(FakeMove("calmmind", self_boost={"spa": 1, "spd": 1}), "spd") == 0.5
-    assert dmg_builder._move_self_delta(FakeMove("irondefense", self_boost={"def": 2}), "def") == 1.0
-    assert dmg_builder._move_self_delta(FakeMove("closecombat", base_power=120, self_boost={"def": -1, "spd": -1}), "def") == -0.5
+    assert dmg_builder.mechanics.move_self_delta(FakeMove("calmmind", self_boost={"spa": 1, "spd": 1}), "def") == 0.0
+    assert dmg_builder.mechanics.move_self_delta(FakeMove("calmmind", self_boost={"spa": 1, "spd": 1}), "spd") == 0.5
+    assert dmg_builder.mechanics.move_self_delta(FakeMove("irondefense", self_boost={"def": 2}), "def") == 1.0
+    assert dmg_builder.mechanics.move_self_delta(FakeMove("closecombat", base_power=120, self_boost={"def": -1, "spd": -1}), "def") == -0.5
     print("  self_def_delta / self_spd_delta: PASS")
 
     # Verify vector placement: setup move in slot 0 should appear at correct index
@@ -1204,7 +1212,7 @@ def main() -> None:
         type=PokemonType.FLYING,
         secondary=[{"chance": 30, "volatileStatus": "flinch"}],
     )
-    flinch_chance = dmg_builder._move_effect_chance(air_slash, volatile_effect=Effect.FLINCH)
+    flinch_chance = dmg_builder.mechanics.move_effect_chance(air_slash, volatile_effect=Effect.FLINCH)
     assert abs(flinch_chance - 0.3) < 0.01, f"Flinch basic: got {flinch_chance}, expected 0.3"
     print("  Flinch chance basic: PASS")
 
@@ -1214,7 +1222,7 @@ def main() -> None:
         types=(PokemonType.FAIRY, PokemonType.FLYING), current_hp_fraction=1.0,
         active=True, ability="serenegrace", item="",
     )
-    flinch_sg = dmg_builder._move_effect_chance(air_slash, volatile_effect=Effect.FLINCH, attacker=sg_attacker)
+    flinch_sg = dmg_builder.mechanics.move_effect_chance(air_slash, volatile_effect=Effect.FLINCH, attacker=sg_attacker)
     assert abs(flinch_sg - 0.6) < 0.01, f"Serene Grace flinch: got {flinch_sg}, expected 0.6"
     print("  Serene Grace doubles flinch (30% -> 60%): PASS")
 
@@ -1224,9 +1232,9 @@ def main() -> None:
         type=PokemonType.ELECTRIC,
         secondary=[{"chance": 30, "status": "par"}],
     )
-    par_sg = dmg_builder._move_effect_chance(discharge, statuses=(Status.PAR,), attacker=sg_attacker)
+    par_sg = dmg_builder.mechanics.move_effect_chance(discharge, statuses=(Status.PAR,), attacker=sg_attacker)
     assert abs(par_sg - 0.6) < 0.01, f"Serene Grace paralysis: got {par_sg}, expected 0.6"
-    par_normal = dmg_builder._move_effect_chance(discharge, statuses=(Status.PAR,))
+    par_normal = dmg_builder.mechanics.move_effect_chance(discharge, statuses=(Status.PAR,))
     assert abs(par_normal - 0.3) < 0.01, f"Normal paralysis: got {par_normal}, expected 0.3"
     print("  Serene Grace doubles paralysis (30% -> 60%): PASS")
 
@@ -1236,7 +1244,7 @@ def main() -> None:
         type=PokemonType.NORMAL,
         secondary=[{"chance": 60, "status": "par"}],  # 60% * 2 = 120% -> cap at 100%
     )
-    par_cap = dmg_builder._move_effect_chance(body_slam, statuses=(Status.PAR,), attacker=sg_attacker)
+    par_cap = dmg_builder.mechanics.move_effect_chance(body_slam, statuses=(Status.PAR,), attacker=sg_attacker)
     assert abs(par_cap - 1.0) < 0.01, f"Serene Grace cap: got {par_cap}, expected 1.0"
     print("  Serene Grace caps at 100%: PASS")
 
@@ -1246,7 +1254,7 @@ def main() -> None:
         types=(PokemonType.FIRE,), current_hp_fraction=1.0,
         active=True, ability="sheerforce", item="",
     )
-    flinch_sf = dmg_builder._move_effect_chance(air_slash, volatile_effect=Effect.FLINCH, attacker=sf_attacker)
+    flinch_sf = dmg_builder.mechanics.move_effect_chance(air_slash, volatile_effect=Effect.FLINCH, attacker=sf_attacker)
     assert flinch_sf == 0.0, f"Sheer Force flinch: got {flinch_sf}, expected 0.0"
     print("  Sheer Force zeroes secondary flinch: PASS")
 
@@ -1255,7 +1263,7 @@ def main() -> None:
         "willowisp", base_power=0, category=MoveCategory.STATUS,
         type=PokemonType.FIRE, status=Status.BRN,
     )
-    burn_sf = dmg_builder._move_effect_chance(willowisp, statuses=(Status.BRN,), attacker=sf_attacker)
+    burn_sf = dmg_builder.mechanics.move_effect_chance(willowisp, statuses=(Status.BRN,), attacker=sf_attacker)
     assert burn_sf == 1.0, f"Sheer Force direct status: got {burn_sf}, expected 1.0"
     print("  Sheer Force preserves direct status (Will-O-Wisp): PASS")
 
@@ -1265,9 +1273,9 @@ def main() -> None:
         type=PokemonType.FAIRY,
         secondary=[{"chance": 30, "boosts": {"spa": -1}}],
     )
-    spa_drop = dmg_builder._move_target_stat_drop_chance(moonblast, "spa")
+    spa_drop = dmg_builder.mechanics.move_target_stat_drop_chance(moonblast, "spa")
     assert abs(spa_drop - 0.3) < 0.01, f"Moonblast SpA drop: got {spa_drop}, expected 0.3"
-    spd_drop = dmg_builder._move_target_stat_drop_chance(moonblast, "spd")
+    spd_drop = dmg_builder.mechanics.move_target_stat_drop_chance(moonblast, "spd")
     assert spd_drop == 0.0, f"Moonblast SpD drop should be 0, got {spd_drop}"
     print("  Target stat drop (Moonblast SpA -30%): PASS")
 
@@ -1276,7 +1284,7 @@ def main() -> None:
         type=PokemonType.GHOST,
         secondary=[{"chance": 20, "boosts": {"spd": -1}}],
     )
-    spd_drop_sb = dmg_builder._move_target_stat_drop_chance(shadow_ball, "spd")
+    spd_drop_sb = dmg_builder.mechanics.move_target_stat_drop_chance(shadow_ball, "spd")
     assert abs(spd_drop_sb - 0.2) < 0.01, f"Shadow Ball SpD drop: got {spd_drop_sb}, expected 0.2"
     print("  Target stat drop (Shadow Ball SpD -20%): PASS")
 
@@ -1286,22 +1294,22 @@ def main() -> None:
         type=PokemonType.ICE,
         secondary=[{"chance": 100, "boosts": {"spe": -1}}],
     )
-    spe_drop = dmg_builder._move_target_stat_drop_chance(icy_wind, "spe")
+    spe_drop = dmg_builder.mechanics.move_target_stat_drop_chance(icy_wind, "spe")
     assert abs(spe_drop - 1.0) < 0.01, f"Icy Wind Spe drop: got {spe_drop}, expected 1.0"
     print("  Target stat drop (Icy Wind Spe -100%): PASS")
 
     # --- Serene Grace + target stat drops ---
-    spa_drop_sg = dmg_builder._move_target_stat_drop_chance(moonblast, "spa", attacker=sg_attacker)
+    spa_drop_sg = dmg_builder.mechanics.move_target_stat_drop_chance(moonblast, "spa", attacker=sg_attacker)
     assert abs(spa_drop_sg - 0.6) < 0.01, f"Serene Grace Moonblast SpA drop: got {spa_drop_sg}, expected 0.6"
     print("  Serene Grace doubles target stat drop (30% -> 60%): PASS")
 
     # --- Sheer Force zeroes target stat drops ---
-    spa_drop_sf = dmg_builder._move_target_stat_drop_chance(moonblast, "spa", attacker=sf_attacker)
+    spa_drop_sf = dmg_builder.mechanics.move_target_stat_drop_chance(moonblast, "spa", attacker=sf_attacker)
     assert spa_drop_sf == 0.0, f"Sheer Force SpA drop: got {spa_drop_sf}, expected 0.0"
     print("  Sheer Force zeroes target stat drops: PASS")
 
     # --- No attacker = backward compatible (no ability modification) ---
-    flinch_no_att = dmg_builder._move_effect_chance(air_slash, volatile_effect=Effect.FLINCH, attacker=None)
+    flinch_no_att = dmg_builder.mechanics.move_effect_chance(air_slash, volatile_effect=Effect.FLINCH, attacker=None)
     assert abs(flinch_no_att - 0.3) < 0.01, f"No attacker flinch: got {flinch_no_att}, expected 0.3"
     print("  Backward compatible (attacker=None): PASS")
 
