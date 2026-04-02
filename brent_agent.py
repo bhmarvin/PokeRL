@@ -35,7 +35,7 @@ REWARD_CONFIG = {
     "fainted_value": 1.0,
     "hp_value": 0.5,
     "status_value": 0.25,
-    "victory_value": 30.0,
+    "victory_value": 5.0,
     "penalty_redundant_stealthrock": -0.1,
     "penalty_redundant_stickyweb": -0.1,
     "penalty_redundant_spikes": -0.1,
@@ -56,8 +56,8 @@ REWARD_CONFIG = {
 
 DECISION_AUDIT_SAMPLE_LIMIT = 20
 
-MOVE_BLOCK_SIZE = 36  # 25 base + 5 status-move + 6 volatile/secondary effect features
-MY_BENCH_SLOT_SIZE = 58  # was 53: +5 (best_ev, ohko, speed, max_incoming, hazard_entry)
+MOVE_BLOCK_SIZE = 37  # 25 base + 5 status-move + 6 volatile/secondary + 1 multi-hit flag
+MY_BENCH_SLOT_SIZE = 63  # 53 base + 5 matchup + 5 status (psn_sev, par, brn, slp, frz)
 OPP_BENCH_SLOT_SIZE = 20
 BENCH_MOVE_FLAG_SIZE = 8
 OPP_THREAT_ROWS = 4
@@ -75,11 +75,11 @@ MY_ACTIVE_START = 24
 OPP_ACTIVE_START = MY_ACTIVE_START + MY_ACTIVE_BLOCK_SIZE  # 84
 SPEED_ADVANTAGE_INDEX = OPP_ACTIVE_START + OPP_ACTIVE_BLOCK_SIZE  # 125
 MY_MOVES_START = SPEED_ADVANTAGE_INDEX + 1  # 126
-MY_BENCH_START = MY_MOVES_START + 4 * MOVE_BLOCK_SIZE  # 226
-OPP_BENCH_START = MY_BENCH_START + 5 * MY_BENCH_SLOT_SIZE  # 516
-TARGETING_START = OPP_BENCH_START + 5 * OPP_BENCH_SLOT_SIZE  # 616
-MY_TEAM_REVEALED_START = TARGETING_START + 20  # 636
-OPP_THREAT_START = MY_TEAM_REVEALED_START + 6  # 642
+MY_BENCH_START = MY_MOVES_START + 4 * MOVE_BLOCK_SIZE  # 274
+OPP_BENCH_START = MY_BENCH_START + 5 * MY_BENCH_SLOT_SIZE  # 589
+TARGETING_START = OPP_BENCH_START + 5 * OPP_BENCH_SLOT_SIZE  # 689
+MY_TEAM_REVEALED_START = TARGETING_START + 20  # 709
+OPP_THREAT_START = MY_TEAM_REVEALED_START + 6  # 715
 OPP_MOVES_VS_ME_START = OPP_THREAT_START + 2
 OPP_THREAT_OHKO_START = OPP_THREAT_START + OPP_THREAT_ROWS * OPP_THREAT_ROW_SIZE
 OPP_THREAT_CONFIDENCE_START = OPP_THREAT_OHKO_START + 6
@@ -796,6 +796,8 @@ class BrentObservationVectorBuilder:
         vector[start + 33] = self._move_target_stat_drop_chance(move, "spd", attacker=attacker)
         vector[start + 34] = self._move_target_stat_drop_chance(move, "spe", attacker=attacker)
         vector[start + 35] = self._move_target_stat_drop_chance(move, "accuracy", attacker=attacker)
+        # Multi-hit flag
+        vector[start + 36] = 1.0 if getattr(move, "n_hit", (1, 1)) != (1, 1) else 0.0
 
     def _fill_my_bench(self, vector: np.ndarray, battle: AbstractBattle) -> None:
         bench = [mon for mon in battle.team.values() if not mon.active][:5]
@@ -820,6 +822,13 @@ class BrentObservationVectorBuilder:
             vector[start + 52] = 1.0 if ability and ability.lower().replace(" ", "") == "intimidate" else 0.0
             # Offensive matchup features vs opponent active
             self._fill_bench_matchup(vector, start + 53, mon, battle, opponent, opp_speed, opp_posterior)
+            # Status conditions (mirror active block pattern)
+            status = mon.status
+            vector[start + 58] = _poison_severity(status)
+            vector[start + 59] = 1.0 if status == Status.PAR else 0.0
+            vector[start + 60] = 1.0 if status == Status.BRN else 0.0
+            vector[start + 61] = 1.0 if status == Status.SLP else 0.0
+            vector[start + 62] = 1.0 if status == Status.FRZ else 0.0
 
     def _fill_bench_matchup(
         self,
@@ -1462,6 +1471,9 @@ class BrentObservationVectorBuilder:
             bp_mult *= 1.2
         elif att_ability == "sandforce" and Weather.SANDSTORM in battle.weather and move_type in (PokemonType.ROCK, PokemonType.GROUND, PokemonType.STEEL):
             bp_mult *= 1.3
+        # -ate abilities: 1.2x BP boost (check original type, not resolved move_type)
+        if att_ability in ("pixilate", "aerilate", "refrigerate", "galvanize") and move.type == PokemonType.NORMAL and move.category != MoveCategory.STATUS:
+            bp_mult *= 1.2
 
         # Terrain BP boosts (grounded attacker)
         is_grounded_att = not (PokemonType.FLYING in getattr(attacker, "types", ()) or att_ability == "levitate")
@@ -1664,6 +1676,12 @@ class BrentObservationVectorBuilder:
         final_min = base_damage * total_mult * 0.85
         final_max = base_damage * total_mult * 1.0
 
+        # Multi-hit moves: scale by expected number of hits
+        expected_hits = getattr(move, "expected_hits", 1) or 1
+        if expected_hits > 1:
+            final_min *= expected_hits
+            final_max *= expected_hits
+
         return final_min, final_max
 
     def _fixed_damage_amount(
@@ -1743,7 +1761,17 @@ class BrentObservationVectorBuilder:
         elif move.id == "revelationdance":
             return attacker.type_1
         elif move.id == "terablast" and attacker.is_terastallized:
-            return attacker.type_1
+            return attacker.tera_type or move.type
+        # -ate abilities: Normal → ability type
+        _ATE_MAP = {
+            "pixilate": PokemonType.FAIRY,
+            "aerilate": PokemonType.FLYING,
+            "refrigerate": PokemonType.ICE,
+            "galvanize": PokemonType.ELECTRIC,
+        }
+        att_ability = (getattr(attacker, "ability", None) or "").lower().replace(" ", "")
+        if move.type == PokemonType.NORMAL and att_ability in _ATE_MAP and move.category != MoveCategory.STATUS:
+            return _ATE_MAP[att_ability]
         return move.type
 
     def _is_pivot(self, move: Move) -> bool:

@@ -17,6 +17,7 @@ os.environ.setdefault(
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.vec_env import SubprocVecEnv
 
 from poke_env.environment.single_agent_wrapper import SingleAgentWrapper
 
@@ -120,8 +121,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-level", type=int, default=40)
     parser.add_argument("--verify-embedding", action="store_true")
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--train-opponent", choices=OPPONENT_CHOICES, default="random")
+    parser.add_argument("--train-opponent", choices=OPPONENT_CHOICES, default="random",
+                        help="Single training opponent (used when --n-envs=1)")
+    parser.add_argument("--train-opponents",
+                        help="Comma-separated opponent mix for SubprocVecEnv (e.g. 'random,random,max_base_power,simple_heuristic')")
     parser.add_argument("--eval-opponent", choices=OPPONENT_CHOICES, default="random")
+    parser.add_argument("--n-envs", type=int, default=1,
+                        help="Number of parallel environments (1=single env, >1=SubprocVecEnv)")
     parser.add_argument("--output-dir", default="results/ppo")
     parser.add_argument("--run-name")
     parser.add_argument("--checkpoint-path")
@@ -145,6 +151,50 @@ def create_wrapped_env(args: argparse.Namespace, opponent_name: str) -> Monitor:
         start_listening=False,
     )
     return Monitor(SingleAgentWrapper(env, opponent))
+
+
+def _make_env_fn(opponent_name: str, battle_format: str, log_level: int):
+    """Lazy factory — all poke_env objects are created inside the subprocess."""
+    def _init():
+        env = BrentsRLAgent(
+            battle_format=battle_format,
+            log_level=log_level,
+            open_timeout=None,
+            strict=True,
+        )
+        opponent = create_opponent(
+            opponent_name,
+            battle_format=battle_format,
+            log_level=log_level,
+            start_listening=False,
+        )
+        return Monitor(SingleAgentWrapper(env, opponent))
+    return _init
+
+
+def _parse_opponent_mix(args: argparse.Namespace) -> list[str]:
+    """Build the list of opponents for SubprocVecEnv workers."""
+    if args.train_opponents:
+        opponents = [o.strip() for o in args.train_opponents.split(",")]
+        for o in opponents:
+            if o not in OPPONENT_CHOICES:
+                raise ValueError(f"Unknown opponent '{o}'. Choices: {', '.join(OPPONENT_CHOICES)}")
+        return opponents
+    return [args.train_opponent] * args.n_envs
+
+
+def create_vec_env(args: argparse.Namespace) -> SubprocVecEnv:
+    """Create a SubprocVecEnv with opponent blending. Each worker lazily
+    instantiates its own poke_env objects to avoid asyncio event loop issues."""
+    opponents = _parse_opponent_mix(args)
+    if len(opponents) != args.n_envs:
+        raise ValueError(
+            f"--train-opponents has {len(opponents)} entries but --n-envs is {args.n_envs}; they must match"
+        )
+    return SubprocVecEnv([
+        _make_env_fn(opp, args.battle_format, args.log_level)
+        for opp in opponents
+    ])
 
 
 def verify_obs(env: Monitor, obs: dict[str, Any], verify_embedding: bool) -> None:
@@ -367,22 +417,32 @@ def main() -> None:
 
     print(f"REWARD_CONFIG: {REWARD_CONFIG}")
 
-    env = create_wrapped_env(args, args.train_opponent)
-    env.reset(seed=args.seed)
-    train_env = env.unwrapped.env
+    use_vec_env = args.n_envs > 1
+    train_env: BrentsRLAgent | None = None
+
+    if use_vec_env:
+        print(f"Creating SubprocVecEnv with {args.n_envs} workers...")
+        env = create_vec_env(args)
+        # SubprocVecEnv doesn't expose inner envs; train reports unavailable
+        train_env = None
+    else:
+        env = create_wrapped_env(args, args.train_opponent)
+        env.reset(seed=args.seed)
+        train_env = env.unwrapped.env
+
     model = build_model(args, env)
 
     try:
         if args.train_timesteps > 0:
             print(f"Starting PPO training for {args.train_timesteps} timesteps...")
-            
+
             # Create the callbacks
             checkpoint_callback = CheckpointCallback(
                 save_freq=args.save_freq,
                 save_path=os.path.join(artifacts["run_dir"], "checkpoints"),
                 name_prefix="rl_model",
             )
-            
+
             eval_callback = PokeEnvEvalCallback(
                 args=args,
                 eval_freq=args.eval_freq,
@@ -405,9 +465,15 @@ def main() -> None:
     model.save(artifacts["checkpoint_path"])
     print(f"Saved checkpoint to {artifacts['checkpoint_path']}")
 
-    train_penalty_report = train_env.get_strategic_penalty_report()
-    train_tactical_shaping_report = train_env.get_tactical_shaping_report()
-    train_decision_audit_report = train_env.get_decision_audit_report()
+    if train_env is not None:
+        train_penalty_report = train_env.get_strategic_penalty_report()
+        train_tactical_shaping_report = train_env.get_tactical_shaping_report()
+        train_decision_audit_report = train_env.get_decision_audit_report()
+    else:
+        train_penalty_report = {}
+        train_tactical_shaping_report = {}
+        train_decision_audit_report = {}
+        print("(SubprocVecEnv: per-worker training reports not available)")
     print(f"Training strategic penalties: {format_penalty_report(train_penalty_report)}")
     print(f"Training tactical shaping: {format_tactical_shaping_report(train_tactical_shaping_report)}")
     print(f"Training decision audit: {format_decision_audit_report(train_decision_audit_report)}")
@@ -423,6 +489,8 @@ def main() -> None:
         "eval_battles": args.eval_battles,
         "seed": args.seed,
         "train_opponent": args.train_opponent,
+        "train_opponents": args.train_opponents,
+        "n_envs": args.n_envs,
         "eval_opponent": args.eval_opponent,
         "verify_embedding": args.verify_embedding,
         "device": args.device,
