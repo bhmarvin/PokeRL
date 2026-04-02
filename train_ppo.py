@@ -400,8 +400,11 @@ class PokeEnvEvalCallback(BaseCallback):
 def build_model(args: argparse.Namespace, env: Monitor) -> PPO:
     if args.resume_from:
         print(f"Loading PPO checkpoint from {args.resume_from}")
-        model = PPO.load(args.resume_from, env=env, device=args.device, tensorboard_log=os.path.join(args.output_dir, "logs"))
-        model.learning_rate = args.learning_rate
+        model = PPO.load(
+            args.resume_from, env=env, device=args.device,
+            tensorboard_log=os.path.join(args.output_dir, "logs"),
+            custom_objects={"learning_rate": args.learning_rate},
+        )
         print(f"  learning_rate overridden to {args.learning_rate}")
         return model
 
