@@ -77,11 +77,6 @@ class StructuredObservationExtractor(BaseFeaturesExtractor):
     def __init__(self, observation_space: Any):
         super().__init__(observation_space, features_dim=self.FEATURES_DIM)
 
-        # Welford RunningMeanStd normalization (applied to full vector before slicing)
-        self.register_buffer("running_mean", th.zeros(VECTOR_LENGTH))
-        self.register_buffer("running_var", th.ones(VECTOR_LENGTH))
-        self.register_buffer("count", th.tensor(1e-4))
-
         # Block encoders
         self.global_enc = nn.Sequential(nn.Linear(_GLOBAL_SIZE, self._GLOBAL_OUT), nn.ReLU())
         self.my_active_enc = nn.Sequential(nn.Linear(_MY_ACTIVE_SIZE, self._MY_ACTIVE_OUT), nn.ReLU())
@@ -92,25 +87,8 @@ class StructuredObservationExtractor(BaseFeaturesExtractor):
         self.targeting_enc = nn.Sequential(nn.Linear(_TARGETING_SIZE, self._TARGETING_OUT), nn.ReLU())
         self.threat_enc = nn.Sequential(nn.Linear(_THREAT_SIZE, self._THREAT_OUT), nn.ReLU())
 
-    def _welford_normalize(self, x: th.Tensor) -> th.Tensor:
-        """Normalize using running mean/variance (Welford's algorithm)."""
-        if self.training:
-            batch_mean = x.mean(dim=0)
-            batch_var = x.var(dim=0, unbiased=False)
-            batch_count = x.shape[0]
-            delta = batch_mean - self.running_mean
-            total = self.count + batch_count
-            self.running_mean += delta * batch_count / total
-            m_a = self.running_var * self.count
-            m_b = batch_var * batch_count
-            m2 = m_a + m_b + delta**2 * self.count * batch_count / total
-            self.running_var = m2 / total
-            self.count = total
-        std = (self.running_var + 1e-8).sqrt()
-        return ((x - self.running_mean) / std).clamp(-10.0, 10.0)
-
     def forward(self, obs: dict[str, th.Tensor]) -> th.Tensor:
-        x = self._welford_normalize(obs["observation"])  # (batch, VECTOR_LENGTH)
+        x = obs["observation"]  # (batch, VECTOR_LENGTH) — pre-normalized to [0,1]
 
         # Slice and encode each semantic block
         global_f = self.global_enc(x[:, :_GLOBAL_END])
