@@ -31,11 +31,11 @@ _GLOBAL_END = MY_ACTIVE_START                          # 0:24
 _MY_ACTIVE_END = OPP_ACTIVE_START                      # 24:84
 _OPP_ACTIVE_END = SPEED_ADVANTAGE_INDEX                # 84:125
 _SPEED_END = SPEED_ADVANTAGE_INDEX + 1                 # 125:126
-_MOVES_END = MY_BENCH_START                            # 126:226
-_MY_BENCH_END = OPP_BENCH_START                        # 226:516
-_OPP_BENCH_END = TARGETING_START                       # 516:616
-_TARGETING_END = MY_TEAM_REVEALED_START                # 616:636
-_THREAT_END = ALIVE_DIFF_INDEX + 1                     # 636:684
+_MOVES_END = MY_BENCH_START                            # 126:274
+_MY_BENCH_END = OPP_BENCH_START                        # 274:589
+_OPP_BENCH_END = TARGETING_START                       # 589:689
+_TARGETING_END = MY_TEAM_REVEALED_START                # 689:709
+_THREAT_END = ALIVE_DIFF_INDEX + 1                     # 709:757
 
 # Block sizes
 _GLOBAL_SIZE = _GLOBAL_END                             # 24

@@ -4,7 +4,7 @@ PokeRL is a reinforcement-learning project built on top of `poke_env` and Stable
 
 The project focuses on:
 
-- a 728-dim structured observation tensor with battle-state, move-value, bench matchup, targeting, and theory-of-mind features
+- a 757-dim structured observation tensor with battle-state, move-value, bench matchup, targeting, and theory-of-mind features
 - a structured feature extractor that processes semantic blocks (active mons, moves, bench slots, threats) through shared-weight encoders before feeding a [256,128] MLP
 - reward shaping on top of `poke_env`'s state-delta helper with tactical levers
 - masked PPO so the policy never assigns probability mass to illegal actions
@@ -13,7 +13,7 @@ The project focuses on:
 
 ## Main Files
 
-- `brent_agent.py`: observation vector (728 dims), reward shaping, damage estimation, type/ability mechanics, tactical lever evaluation
+- `brent_agent.py`: observation vector (757 dims), reward shaping, damage estimation, type/ability mechanics, tactical lever evaluation
 - `train_ppo.py`: training entry point, checkpoint loading, eval callback, summary writing
 - `policies.py`: structured observation extractor (9 semantic block encoders) and masked PPO policy
 - `opponents.py`: opponent selection (`random`, `max_base_power`, `simple_heuristic`)
@@ -21,7 +21,7 @@ The project focuses on:
 - `test_runner.py`: observation vector, tera, damage calc, volatile effect, and reward lever tests
 - `inspect_battle_debug.py`: interactive battle and embedding inspector
 
-## Observation Vector (728 dims)
+## Observation Vector (757 dims)
 
 | Block | Size | Description |
 |-------|------|-------------|
@@ -29,13 +29,13 @@ The project focuses on:
 | My Active | 60 | HP, types, boosts, status, volatiles, items, tera (type + flags) |
 | Opp Active | 41 | HP, types, boosts, status, volatiles, items, tera flag |
 | Speed | 1 | Speed advantage vs opponent active |
-| My Moves (4x36) | 144 | Damage range, accuracy, EV, KO flag, STAB, category, effects, setup/hazard/recovery flags, flinch, target stat drops |
-| My Bench (5x58) | 290 | HP, types, move flags, intimidate, offensive matchup vs opp active (best EV, OHKO, speed), defensive matchup (max incoming), hazard entry damage |
+| My Moves (4x37) | 148 | Damage range, accuracy, EV, KO flag, STAB, category, effects, setup/hazard/recovery flags, flinch, target stat drops, multi-hit flag |
+| My Bench (5x63) | 315 | HP, types, move flags, intimidate, offensive matchup vs opp active (best EV, OHKO, speed), defensive matchup (max incoming), hazard entry damage, status conditions |
 | Opp Bench (5x20) | 100 | Revealed flag, HP, types |
 | Targeting (4x5) | 20 | My moves damage EV vs each opp bench slot |
 | Threat/Meta | 48 | Team revealed, opp threat rows (4 moves x EV vs team), OHKO risk, role confidence, recharge, alive count diff |
 
-### Move Block Detail (36 features per move)
+### Move Block Detail (37 features per move)
 
 | Index | Feature | Range |
 |-------|---------|-------|
@@ -60,6 +60,7 @@ The project focuses on:
 | 29 | Is recovery move (Recover, Roost, etc.) | {0, 1} |
 | 30 | Flinch chance | [0, 1] |
 | 31-35 | Target stat drop chances (def, spa, spd, spe, accuracy) | [0, 1] |
+| 36 | Multi-hit move | {0, 1} |
 
 Status/flinch/stat-drop chances are **ability-aware**: Serene Grace doubles secondary chances; Sheer Force zeroes them.
 
@@ -67,7 +68,7 @@ Status/flinch/stat-drop chances are **ability-aware**: Serene Grace doubles seco
 
 The manual damage calculator (`_manual_damage_calc`) implements the Gen 9 damage formula with Bayesian role-weighted stat inference for opponent Pokemon. Modifier coverage includes:
 
-**Base Power:** Technician, Sheer Force, Tough Claws, Strong Jaw, Mega Launcher, Sharpness, Punk Rock, Iron Fist, Reckless, Sand Force, terrain boosts (Electric/Grassy/Psychic), terrain reductions (Misty/Grassy), move-specific (Facade, Brine, Venoshock, Hex, Knockoff), Dry Skin
+**Base Power:** Technician, Sheer Force, Tough Claws, Strong Jaw, Mega Launcher, Sharpness, Punk Rock, Iron Fist, Reckless, Sand Force, Pixilate/Aerilate/Refrigerate/Galvanize (1.2x), terrain boosts (Electric/Grassy/Psychic), terrain reductions (Misty/Grassy), move-specific (Facade, Brine, Venoshock, Hex, Knockoff), Dry Skin
 
 **Attack Stat:** Choice Band/Specs, Guts, Huge Power/Pure Power, Water Bubble, Solar Power, Gorilla Tactics, Steelworker/Dragon's Maw/Rocky Payload, Transistor, Flash Fire, pinch abilities (Overgrow/Blaze/Torrent/Swarm), Thick Fat/Heatproof (defender)
 
@@ -75,11 +76,13 @@ The manual damage calculator (`_manual_damage_calc`) implements the Gen 9 damage
 
 **Final Modifiers:** STAB (including tera + Adaptability), weather (with Utility Umbrella), burn (with Guts/Facade exceptions), screens (Reflect/Light Screen/Aurora Veil), Solid Rock/Filter/Prism Armor, Multiscale/Shadow Shield, Tinted Lens, Neuroforce, Life Orb, Expert Belt
 
-**Special Moves:** Body Press (uses Def stat), Foul Play (uses target's Atk), Unaware (ignores boosts), Hustle, Hydro Steam
+**Special Moves:** Body Press (uses Def stat), Foul Play (uses target's Atk), Unaware (ignores boosts), Hustle, Hydro Steam, multi-hit scaling (expected hits)
+
+**Type Resolution:** Weather Ball, Judgment, Nature Power, Terrain Pulse, Revelation Dance, Tera Blast (tera type), Pixilate/Aerilate/Refrigerate/Galvanize (Normal → ability type)
 
 ## Structured Extractor
 
-The `StructuredObservationExtractor` in `policies.py` normalizes the full vector (Welford), then slices into 9 semantic blocks. Each block passes through a small Linear+ReLU encoder. Repeated structures (moves, bench slots) use **shared-weight encoders** -- the same network processes each slot. Output is 561 dims fed to a [256,128] actor-critic MLP.
+The `StructuredObservationExtractor` in `policies.py` normalizes the full vector (Welford), then slices into 9 semantic blocks. Each block passes through a small Linear+ReLU encoder. Repeated structures (moves, bench slots) use **shared-weight encoders** -- the same network processes each slot. Output is 561 dims fed to a [256,128] actor-critic MLP. Block sizes auto-derive from `brent_agent.py` constants.
 
 ## Reward Shaping
 
@@ -145,4 +148,4 @@ Use the inspector to step through live battles and compare embedding values:
 .\venv\Scripts\python.exe test_runner.py
 ```
 
-Tests cover: observation vector shape and content, tera observation encoding, tera immunity reward, tera damage calcs, damage calc modifiers (17 tests covering abilities/items/terrain/screens/weather), move block features (setup/hazard/recovery), volatile effects (flinch/stat drops with Serene Grace/Sheer Force awareness), and reward lever assertions.
+Tests cover: observation vector shape and content, tera observation encoding, tera immunity reward, tera damage calcs, damage calc modifiers (17 tests covering abilities/items/terrain/screens/weather), multi-hit damage scaling, -ate ability type resolution and BP boost, move block features (setup/hazard/recovery/multi-hit), volatile effects (flinch/stat drops with Serene Grace/Sheer Force awareness), bench status encoding, and reward lever assertions.
