@@ -117,7 +117,7 @@ class StructuredObservationExtractor(BaseFeaturesExtractor):
         opp_act_f = self.opp_active_enc(x[:, OPP_ACTIVE_START:_OPP_ACTIVE_END])
         speed_f = x[:, SPEED_ADVANTAGE_INDEX:_SPEED_END]
 
-        # Shared move encoder: 4 moves × 25 features each
+        # Shared move encoder: 4 moves × MOVE_BLOCK_SIZE features each
         move_embeds = []
         for i in range(4):
             start = MY_MOVES_START + i * MOVE_BLOCK_SIZE

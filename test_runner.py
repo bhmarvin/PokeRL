@@ -12,6 +12,7 @@ from poke_env.battle.move_category import MoveCategory
 from poke_env.battle.pokemon_type import PokemonType
 from poke_env.battle.side_condition import SideCondition
 from poke_env.battle.status import Status
+from poke_env.battle.weather import Weather
 
 from brent_agent import (
     MOVE_BLOCK_SIZE,
@@ -40,6 +41,7 @@ from brent_agent import (
 class FakeMove:
     id: str
     accuracy: float = 1.0
+    base_power: int = 0
     category: MoveCategory = MoveCategory.PHYSICAL
     flags: set[str] = field(default_factory=set)
     priority: int = 0
@@ -53,6 +55,9 @@ class FakeMove:
     volatile_status: Optional[Effect] = None
     secondary: list[dict[str, object]] = field(default_factory=list)
     type: PokemonType = PokemonType.NORMAL
+    entry: dict = field(default_factory=dict)
+    ignore_defensive: bool = False
+    damage: object = 0
 
 
 @dataclass
@@ -796,6 +801,513 @@ def main() -> None:
     print("  Tera damage calc tests passed.")
 
     print("Observation vector smoke test passed.")
+
+    # =========================================================
+    # Damage calc modifier tests
+    # =========================================================
+    print("\n-- Damage calc modifier tests ---------------------")
+    from brent_agent import _clamp01
+    from poke_env.data import GenData
+
+    gen_data = GenData.from_gen(9)
+    dmg_builder = DeterministicBuilder()
+
+    def _quick_dmg(
+        attacker: FakePokemon,
+        defender: FakePokemon,
+        move: FakeMove,
+        battle: FakeBattle,
+        att_stats=None,
+        def_stats=None,
+    ):
+        """Helper: run _manual_damage_calc and return (min, max) raw damage."""
+        return dmg_builder._manual_damage_calc(
+            attacker, defender, move, battle,
+            att_stats or attacker.stats,
+            def_stats or defender.stats,
+        )
+
+    # --- Test 1: Vanilla physical (no modifiers) ---
+    vanilla_battle = build_fake_battle()
+    vanilla_battle.weather = {}
+    vanilla_battle.fields = {}
+    vanilla_battle.side_conditions = {}
+    vanilla_battle.opponent_side_conditions = {}
+    attacker = vanilla_battle.active_pokemon
+    attacker.status = None
+    attacker.ability = None
+    attacker.item = ""
+    defender = vanilla_battle.opponent_active_pokemon
+    defender.ability = None
+    defender.item = ""
+
+    tackle = FakeMove("tackle", base_power=40, category=MoveCategory.PHYSICAL, type=PokemonType.NORMAL)
+    d_min, d_max = _quick_dmg(attacker, defender, tackle, vanilla_battle)
+    # Level 80, 100 atk vs 100 def, 40 bp: ((2*80/5+2)*40*100/100)/50+2 = (34*40*1)/50+2 = 29.2
+    # No STAB (attacker types are Bug/Poison), no modifiers => 29.2 * 0.85 = 24.82, max 29.2
+    assert 24.0 < d_min < 26.0, f"vanilla min={d_min}"
+    assert 28.0 < d_max < 31.0, f"vanilla max={d_max}"
+    print("  Vanilla physical calc: PASS")
+
+    # --- Test 2: STAB ---
+    # Give attacker Normal type
+    stab_attacker = FakePokemon(
+        name="StabMon", species="stoutland",
+        types=(PokemonType.NORMAL,), current_hp_fraction=1.0,
+        active=True, ability=None, item="",
+    )
+    d_min_stab, d_max_stab = _quick_dmg(stab_attacker, defender, tackle, vanilla_battle)
+    # Should be 1.5x the vanilla values
+    ratio = d_max_stab / d_max
+    assert 1.45 < ratio < 1.55, f"STAB ratio={ratio}, expected ~1.5"
+    print("  STAB multiplier: PASS")
+
+    # --- Test 3: Choice Band ---
+    cb_attacker = FakePokemon(
+        name="CBMon", species="stoutland",
+        types=(PokemonType.NORMAL,), current_hp_fraction=1.0,
+        active=True, ability=None, item="choiceband",
+    )
+    d_min_cb, d_max_cb = _quick_dmg(cb_attacker, defender, tackle, vanilla_battle)
+    ratio_cb = d_max_cb / d_max_stab
+    assert 1.45 < ratio_cb < 1.55, f"Choice Band ratio={ratio_cb}, expected ~1.5"
+    print("  Choice Band: PASS")
+
+    # --- Test 4: Life Orb ---
+    lo_attacker = FakePokemon(
+        name="LOMon", species="stoutland",
+        types=(PokemonType.NORMAL,), current_hp_fraction=1.0,
+        active=True, ability=None, item="lifeorb",
+    )
+    d_min_lo, d_max_lo = _quick_dmg(lo_attacker, defender, tackle, vanilla_battle)
+    ratio_lo = d_max_lo / d_max_stab
+    assert 1.25 < ratio_lo < 1.35, f"Life Orb ratio={ratio_lo}, expected ~1.3"
+    print("  Life Orb: PASS")
+
+    # --- Test 5: Technician ---
+    tech_attacker = FakePokemon(
+        name="TechMon", species="stoutland",
+        types=(PokemonType.NORMAL,), current_hp_fraction=1.0,
+        active=True, ability="technician", item="",
+    )
+    d_min_tech, d_max_tech = _quick_dmg(tech_attacker, defender, tackle, vanilla_battle)
+    ratio_tech = d_max_tech / d_max_stab
+    assert 1.45 < ratio_tech < 1.55, f"Technician ratio={ratio_tech}, expected ~1.5"
+    print("  Technician (bp<=60): PASS")
+
+    # --- Test 6: Huge Power ---
+    hp_attacker = FakePokemon(
+        name="HPMon", species="azumarill",
+        types=(PokemonType.WATER, PokemonType.FAIRY), current_hp_fraction=1.0,
+        active=True, ability="hugepower", item="",
+    )
+    aquajet = FakeMove("aquajet", base_power=40, category=MoveCategory.PHYSICAL, type=PokemonType.WATER, priority=1)
+    d_min_hp, d_max_hp = _quick_dmg(hp_attacker, defender, aquajet, vanilla_battle)
+    # vs vanilla attacker with same move (no STAB normal)
+    neutral_att = FakePokemon(
+        name="NeutralMon", species="test",
+        types=(PokemonType.WATER, PokemonType.FAIRY), current_hp_fraction=1.0,
+        active=True, ability=None, item="",
+    )
+    d_min_neut, d_max_neut = _quick_dmg(neutral_att, defender, aquajet, vanilla_battle)
+    ratio_hp = d_max_hp / d_max_neut
+    assert 1.9 < ratio_hp < 2.1, f"Huge Power ratio={ratio_hp}, expected ~2.0"
+    print("  Huge Power: PASS")
+
+    # --- Test 7: Weather (Rain + Water move) ---
+    rain_battle = build_fake_battle()
+    rain_battle.weather = {Weather.RAINDANCE: 1}
+    rain_battle.fields = {}
+    rain_battle.side_conditions = {}
+    rain_battle.opponent_side_conditions = {}
+    rain_battle.active_pokemon.ability = None
+    rain_battle.active_pokemon.item = ""
+    rain_battle.opponent_active_pokemon.ability = None
+    rain_battle.opponent_active_pokemon.item = ""
+    rain_battle.active_pokemon.status = None
+    surf = FakeMove("surf", base_power=90, category=MoveCategory.SPECIAL, type=PokemonType.WATER)
+    d_min_rain, d_max_rain = _quick_dmg(rain_battle.active_pokemon, rain_battle.opponent_active_pokemon, surf, rain_battle)
+    no_rain_battle = build_fake_battle()
+    no_rain_battle.weather = {}
+    no_rain_battle.fields = {}
+    no_rain_battle.side_conditions = {}
+    no_rain_battle.opponent_side_conditions = {}
+    no_rain_battle.active_pokemon.ability = None
+    no_rain_battle.active_pokemon.item = ""
+    no_rain_battle.opponent_active_pokemon.ability = None
+    no_rain_battle.opponent_active_pokemon.item = ""
+    no_rain_battle.active_pokemon.status = None
+    d_min_dry, d_max_dry = _quick_dmg(no_rain_battle.active_pokemon, no_rain_battle.opponent_active_pokemon, surf, no_rain_battle)
+    ratio_rain = d_max_rain / d_max_dry
+    assert 1.45 < ratio_rain < 1.55, f"Rain ratio={ratio_rain}, expected ~1.5"
+    print("  Rain boost: PASS")
+
+    # --- Test 8: Reflect (physical screen) ---
+    screen_battle = build_fake_battle()
+    screen_battle.weather = {}
+    screen_battle.fields = {}
+    # Defender has Reflect up (opponent side conditions when we attack)
+    screen_battle.opponent_side_conditions = {SideCondition.REFLECT: 1}
+    screen_battle.side_conditions = {}
+    screen_battle.active_pokemon.ability = None
+    screen_battle.active_pokemon.item = ""
+    screen_battle.active_pokemon.status = None
+    screen_battle.opponent_active_pokemon.ability = None
+    screen_battle.opponent_active_pokemon.item = ""
+    d_min_scr, d_max_scr = _quick_dmg(screen_battle.active_pokemon, screen_battle.opponent_active_pokemon, tackle, screen_battle)
+    ratio_scr = d_max_scr / d_max  # vs vanilla
+    assert 0.45 < ratio_scr < 0.55, f"Reflect ratio={ratio_scr}, expected ~0.5"
+    print("  Reflect screen: PASS")
+
+    # --- Test 9: Body Press uses Defense stat ---
+    bodypress_move = FakeMove("bodypress", base_power=80, category=MoveCategory.PHYSICAL, type=PokemonType.FIGHTING)
+    # Mon with high def, low atk
+    bp_attacker = FakePokemon(
+        name="BPMon", species="corviknight",
+        types=(PokemonType.FLYING, PokemonType.STEEL), current_hp_fraction=1.0,
+        active=True, ability=None, item="",
+        stats={"hp": 250, "atk": 80, "def": 200, "spa": 60, "spd": 120, "spe": 90},
+    )
+    d_min_bp, d_max_bp = _quick_dmg(bp_attacker, defender, bodypress_move, vanilla_battle)
+    # Now test with a normal fighting move (same bp) - should use atk=80 instead of def=200
+    closecombat = FakeMove("closecombat", base_power=80, category=MoveCategory.PHYSICAL, type=PokemonType.FIGHTING)
+    d_min_cc, d_max_cc = _quick_dmg(bp_attacker, defender, closecombat, vanilla_battle)
+    # Body Press should do 200/80 = 2.5x more than close combat
+    ratio_bp = d_max_bp / d_max_cc
+    assert 2.4 < ratio_bp < 2.6, f"Body Press ratio={ratio_bp}, expected ~2.5"
+    print("  Body Press (uses Def): PASS")
+
+    # --- Test 10: Burn penalty (with Guts exception) ---
+    burn_attacker = FakePokemon(
+        name="BurnMon", species="stoutland",
+        types=(PokemonType.NORMAL,), current_hp_fraction=1.0,
+        active=True, ability=None, item="", status=Status.BRN,
+    )
+    d_min_burn, d_max_burn = _quick_dmg(burn_attacker, defender, tackle, vanilla_battle)
+    ratio_burn = d_max_burn / d_max_stab  # vs STAB normal (same types)
+    assert 0.45 < ratio_burn < 0.55, f"Burn ratio={ratio_burn}, expected ~0.5"
+
+    guts_attacker = FakePokemon(
+        name="GutsMon", species="stoutland",
+        types=(PokemonType.NORMAL,), current_hp_fraction=1.0,
+        active=True, ability="guts", item="", status=Status.BRN,
+    )
+    d_min_guts, d_max_guts = _quick_dmg(guts_attacker, defender, tackle, vanilla_battle)
+    # Guts: no burn penalty, +50% atk = should be 1.5x normal STAB
+    ratio_guts = d_max_guts / d_max_stab
+    assert 1.45 < ratio_guts < 1.55, f"Guts ratio={ratio_guts}, expected ~1.5"
+    print("  Burn penalty + Guts: PASS")
+
+    # --- Test 11: Thick Fat ---
+    tf_defender = FakePokemon(
+        name="TFMon", species="snorlax",
+        types=(PokemonType.NORMAL,), current_hp_fraction=1.0,
+        active=True, ability="thickfat", item="",
+    )
+    no_tf_defender = FakePokemon(
+        name="NoTFMon", species="snorlax",
+        types=(PokemonType.NORMAL,), current_hp_fraction=1.0,
+        active=True, ability=None, item="",
+    )
+    fire_move = FakeMove("flamethrower", base_power=90, category=MoveCategory.SPECIAL, type=PokemonType.FIRE)
+    d_min_tf, d_max_tf = _quick_dmg(attacker, tf_defender, fire_move, vanilla_battle)
+    d_min_notf, d_max_notf = _quick_dmg(attacker, no_tf_defender, fire_move, vanilla_battle)
+    ratio_tf = d_max_tf / d_max_notf
+    assert 0.45 < ratio_tf < 0.55, f"Thick Fat ratio={ratio_tf}, expected ~0.5"
+    print("  Thick Fat: PASS")
+
+    # --- Test 12: Electric Terrain + Electric move ---
+    terrain_battle = build_fake_battle()
+    terrain_battle.weather = {}
+    terrain_battle.fields = {Field.ELECTRIC_TERRAIN: 1}
+    terrain_battle.side_conditions = {}
+    terrain_battle.opponent_side_conditions = {}
+    terrain_battle.active_pokemon.ability = None
+    terrain_battle.active_pokemon.item = ""
+    terrain_battle.active_pokemon.status = None
+    terrain_battle.opponent_active_pokemon.ability = None
+    terrain_battle.opponent_active_pokemon.item = ""
+    no_terrain_battle = build_fake_battle()
+    no_terrain_battle.weather = {}
+    no_terrain_battle.fields = {}
+    no_terrain_battle.side_conditions = {}
+    no_terrain_battle.opponent_side_conditions = {}
+    no_terrain_battle.active_pokemon.ability = None
+    no_terrain_battle.active_pokemon.item = ""
+    no_terrain_battle.active_pokemon.status = None
+    no_terrain_battle.opponent_active_pokemon.ability = None
+    no_terrain_battle.opponent_active_pokemon.item = ""
+    tbolt = FakeMove("thunderbolt", base_power=90, category=MoveCategory.SPECIAL, type=PokemonType.ELECTRIC)
+    # Use a non-Ground defender so Electric isn't immune
+    terrain_target = FakePokemon(
+        name="TerrTarget", species="test",
+        types=(PokemonType.NORMAL,), current_hp_fraction=1.0,
+        active=True, ability=None, item="",
+    )
+    # Dragonite is Dragon/Flying — Flying type means not grounded, no terrain boost
+    # Use a grounded attacker for terrain test
+    grounded_att = FakePokemon(
+        name="GroundedAtt", species="test",
+        types=(PokemonType.NORMAL,), current_hp_fraction=1.0,
+        active=True, ability=None, item="",
+    )
+    terrain_battle.active_pokemon = grounded_att
+    no_terrain_battle.active_pokemon = grounded_att
+    d_min_et, d_max_et = _quick_dmg(grounded_att, terrain_target, tbolt, terrain_battle)
+    d_min_noet, d_max_noet = _quick_dmg(grounded_att, terrain_target, tbolt, no_terrain_battle)
+    ratio_et = d_max_et / d_max_noet
+    assert 1.25 < ratio_et < 1.35, f"Electric Terrain ratio={ratio_et}, expected ~1.3"
+    print("  Electric Terrain: PASS")
+
+    # --- Test 13: Eviolite ---
+    evo_defender = FakePokemon(
+        name="EvoMon", species="chansey",
+        types=(PokemonType.NORMAL,), current_hp_fraction=1.0,
+        active=True, ability=None, item="eviolite",
+    )
+    d_min_evo, d_max_evo = _quick_dmg(attacker, evo_defender, tackle, vanilla_battle)
+    ratio_evo = d_max_evo / d_max
+    assert 0.6 < ratio_evo < 0.7, f"Eviolite ratio={ratio_evo}, expected ~0.667"
+    print("  Eviolite: PASS")
+
+    # --- Test 14: Sandstorm SpD boost for Rock types ---
+    sand_battle = build_fake_battle()
+    sand_battle.weather = {Weather.SANDSTORM: 1}
+    sand_battle.fields = {}
+    sand_battle.side_conditions = {}
+    sand_battle.opponent_side_conditions = {}
+    sand_battle.active_pokemon.ability = None
+    sand_battle.active_pokemon.item = ""
+    sand_battle.active_pokemon.status = None
+    rock_defender = FakePokemon(
+        name="RockMon", species="tyranitar",
+        types=(PokemonType.ROCK, PokemonType.DARK), current_hp_fraction=1.0,
+        active=True, ability=None, item="",
+    )
+    ice_beam = FakeMove("icebeam", base_power=90, category=MoveCategory.SPECIAL, type=PokemonType.ICE)
+    d_min_sand, d_max_sand = _quick_dmg(sand_battle.active_pokemon, rock_defender, ice_beam, sand_battle)
+    d_min_nosand, d_max_nosand = _quick_dmg(no_terrain_battle.active_pokemon, rock_defender, ice_beam, no_terrain_battle)
+    ratio_sand = d_max_sand / d_max_nosand
+    assert 0.6 < ratio_sand < 0.7, f"Sandstorm SpD ratio={ratio_sand}, expected ~0.667"
+    print("  Sandstorm SpD boost: PASS")
+
+    # --- Test 15: Multiscale at full HP ---
+    ms_defender = FakePokemon(
+        name="MSMon", species="dragonite",
+        types=(PokemonType.DRAGON, PokemonType.FLYING), current_hp_fraction=1.0,
+        active=True, ability="multiscale", item="",
+    )
+    d_min_ms, d_max_ms = _quick_dmg(attacker, ms_defender, ice_beam, vanilla_battle)
+    ms_defender_hurt = FakePokemon(
+        name="MSMon", species="dragonite",
+        types=(PokemonType.DRAGON, PokemonType.FLYING), current_hp_fraction=0.9,
+        active=True, ability="multiscale", item="",
+    )
+    d_min_ms2, d_max_ms2 = _quick_dmg(attacker, ms_defender_hurt, ice_beam, vanilla_battle)
+    ratio_ms = d_max_ms / d_max_ms2
+    assert 0.45 < ratio_ms < 0.55, f"Multiscale ratio={ratio_ms}, expected ~0.5"
+    print("  Multiscale: PASS")
+
+    # --- Test 16: Adaptability (non-tera) ---
+    adapt_attacker = FakePokemon(
+        name="AdaptMon", species="porygonz",
+        types=(PokemonType.NORMAL,), current_hp_fraction=1.0,
+        active=True, ability="adaptability", item="",
+    )
+    d_min_adapt, d_max_adapt = _quick_dmg(adapt_attacker, defender, tackle, vanilla_battle)
+    ratio_adapt = d_max_adapt / d_max_stab  # vs normal STAB (1.5x)
+    # Adaptability = 2.0x STAB vs 1.5x, so ratio should be ~1.333
+    assert 1.3 < ratio_adapt < 1.4, f"Adaptability ratio={ratio_adapt}, expected ~1.333"
+    print("  Adaptability: PASS")
+
+    # --- Test 17: Foul Play uses defender's Attack ---
+    foulplay = FakeMove("foulplay", base_power=95, category=MoveCategory.PHYSICAL, type=PokemonType.DARK)
+    fp_attacker = FakePokemon(
+        name="FPMon", species="sableye",
+        types=(PokemonType.DARK, PokemonType.GHOST), current_hp_fraction=1.0,
+        active=True, ability=None, item="",
+        stats={"hp": 100, "atk": 50, "def": 100, "spa": 100, "spd": 100, "spe": 100},
+    )
+    high_atk_defender = FakePokemon(
+        name="HighAtk", species="test",
+        types=(PokemonType.NORMAL,), current_hp_fraction=1.0,
+        active=True, ability=None, item="",
+        stats={"hp": 100, "atk": 200, "def": 100, "spa": 100, "spd": 100, "spe": 100},
+    )
+    low_atk_defender = FakePokemon(
+        name="LowAtk", species="test",
+        types=(PokemonType.NORMAL,), current_hp_fraction=1.0,
+        active=True, ability=None, item="",
+        stats={"hp": 100, "atk": 50, "def": 100, "spa": 100, "spd": 100, "spe": 100},
+    )
+    d_min_fp_high, d_max_fp_high = _quick_dmg(fp_attacker, high_atk_defender, foulplay, vanilla_battle)
+    d_min_fp_low, d_max_fp_low = _quick_dmg(fp_attacker, low_atk_defender, foulplay, vanilla_battle)
+    ratio_fp = d_max_fp_high / d_max_fp_low
+    assert 3.5 < ratio_fp < 4.5, f"Foul Play ratio={ratio_fp}, expected ~4.0"
+    print("  Foul Play (uses target's Atk): PASS")
+
+    print("  All damage calc modifier tests passed!")
+
+    # =========================================================
+    # Move block feature tests (new status-move features)
+    # =========================================================
+    print("\n-- Move block feature tests ------------------------")
+
+    # Test setup move detection
+    assert dmg_builder._move_is_setup(FakeMove("swordsdance", self_boost={"atk": 2})) == 1.0
+    assert dmg_builder._move_is_setup(FakeMove("calmmind", self_boost={"spa": 1, "spd": 1})) == 1.0
+    assert dmg_builder._move_is_setup(FakeMove("tackle")) == 0.0
+    assert dmg_builder._move_is_setup(FakeMove("closecombat", base_power=120, self_boost={"def": -1, "spd": -1})) == 0.0  # net negative
+    print("  is_setup detection: PASS")
+
+    # Test hazard move detection
+    assert dmg_builder._move_is_hazard(FakeMove("stealthrock")) == 1.0
+    assert dmg_builder._move_is_hazard(FakeMove("spikes")) == 1.0
+    assert dmg_builder._move_is_hazard(FakeMove("tackle")) == 0.0
+    print("  is_hazard detection: PASS")
+
+    # Test recovery move detection
+    assert dmg_builder._move_is_recovery(FakeMove("recover", heal=0.5)) == 1.0
+    assert dmg_builder._move_is_recovery(FakeMove("roost", heal=0.5)) == 1.0
+    assert dmg_builder._move_is_recovery(FakeMove("tackle")) == 0.0
+    assert dmg_builder._move_is_recovery(FakeMove("moonlight", heal=0.5)) == 1.0
+    print("  is_recovery detection: PASS")
+
+    # Test self_def_delta and self_spd_delta
+    assert dmg_builder._move_self_delta(FakeMove("calmmind", self_boost={"spa": 1, "spd": 1}), "def") == 0.0
+    assert dmg_builder._move_self_delta(FakeMove("calmmind", self_boost={"spa": 1, "spd": 1}), "spd") == 0.5
+    assert dmg_builder._move_self_delta(FakeMove("irondefense", self_boost={"def": 2}), "def") == 1.0
+    assert dmg_builder._move_self_delta(FakeMove("closecombat", base_power=120, self_boost={"def": -1, "spd": -1}), "def") == -0.5
+    print("  self_def_delta / self_spd_delta: PASS")
+
+    # Verify vector placement: setup move in slot 0 should appear at correct index
+    setup_battle = build_fake_battle()
+    # Replace first available move with Swords Dance
+    sd_move = Move("swordsdance", 9)
+    setup_battle.available_moves = [sd_move] + list(setup_battle.available_moves[1:])
+    setup_vector = builder.embed_battle(setup_battle)
+    # Index 27 (is_setup) of move slot 0
+    setup_idx = MY_MOVES_START + 27
+    assert setup_vector[setup_idx] == 1.0, f"Swords Dance is_setup flag not set at index {setup_idx}, got {setup_vector[setup_idx]}"
+    print("  Vector placement (is_setup): PASS")
+
+    print("  All move block feature tests passed!")
+
+    # =========================================================
+    # Volatile effect / Serene Grace / Sheer Force tests
+    # =========================================================
+    print("\n-- Volatile effect + ability tests ------------------")
+
+    # --- Flinch chance basic ---
+    air_slash = FakeMove(
+        "airslash", base_power=75, category=MoveCategory.SPECIAL,
+        type=PokemonType.FLYING,
+        secondary=[{"chance": 30, "volatileStatus": "flinch"}],
+    )
+    flinch_chance = dmg_builder._move_effect_chance(air_slash, volatile_effect=Effect.FLINCH)
+    assert abs(flinch_chance - 0.3) < 0.01, f"Flinch basic: got {flinch_chance}, expected 0.3"
+    print("  Flinch chance basic: PASS")
+
+    # --- Serene Grace doubles flinch ---
+    sg_attacker = FakePokemon(
+        name="SGMon", species="togekiss",
+        types=(PokemonType.FAIRY, PokemonType.FLYING), current_hp_fraction=1.0,
+        active=True, ability="serenegrace", item="",
+    )
+    flinch_sg = dmg_builder._move_effect_chance(air_slash, volatile_effect=Effect.FLINCH, attacker=sg_attacker)
+    assert abs(flinch_sg - 0.6) < 0.01, f"Serene Grace flinch: got {flinch_sg}, expected 0.6"
+    print("  Serene Grace doubles flinch (30% -> 60%): PASS")
+
+    # --- Serene Grace doubles status chances ---
+    discharge = FakeMove(
+        "discharge", base_power=80, category=MoveCategory.SPECIAL,
+        type=PokemonType.ELECTRIC,
+        secondary=[{"chance": 30, "status": "par"}],
+    )
+    par_sg = dmg_builder._move_effect_chance(discharge, statuses=(Status.PAR,), attacker=sg_attacker)
+    assert abs(par_sg - 0.6) < 0.01, f"Serene Grace paralysis: got {par_sg}, expected 0.6"
+    par_normal = dmg_builder._move_effect_chance(discharge, statuses=(Status.PAR,))
+    assert abs(par_normal - 0.3) < 0.01, f"Normal paralysis: got {par_normal}, expected 0.3"
+    print("  Serene Grace doubles paralysis (30% -> 60%): PASS")
+
+    # --- Serene Grace caps at 100% ---
+    body_slam = FakeMove(
+        "bodyslam", base_power=85, category=MoveCategory.PHYSICAL,
+        type=PokemonType.NORMAL,
+        secondary=[{"chance": 60, "status": "par"}],  # 60% * 2 = 120% -> cap at 100%
+    )
+    par_cap = dmg_builder._move_effect_chance(body_slam, statuses=(Status.PAR,), attacker=sg_attacker)
+    assert abs(par_cap - 1.0) < 0.01, f"Serene Grace cap: got {par_cap}, expected 1.0"
+    print("  Serene Grace caps at 100%: PASS")
+
+    # --- Sheer Force zeroes secondary flinch ---
+    sf_attacker = FakePokemon(
+        name="SFMon", species="darmanitan",
+        types=(PokemonType.FIRE,), current_hp_fraction=1.0,
+        active=True, ability="sheerforce", item="",
+    )
+    flinch_sf = dmg_builder._move_effect_chance(air_slash, volatile_effect=Effect.FLINCH, attacker=sf_attacker)
+    assert flinch_sf == 0.0, f"Sheer Force flinch: got {flinch_sf}, expected 0.0"
+    print("  Sheer Force zeroes secondary flinch: PASS")
+
+    # --- Sheer Force does NOT affect direct status ---
+    willowisp = FakeMove(
+        "willowisp", base_power=0, category=MoveCategory.STATUS,
+        type=PokemonType.FIRE, status=Status.BRN,
+    )
+    burn_sf = dmg_builder._move_effect_chance(willowisp, statuses=(Status.BRN,), attacker=sf_attacker)
+    assert burn_sf == 1.0, f"Sheer Force direct status: got {burn_sf}, expected 1.0"
+    print("  Sheer Force preserves direct status (Will-O-Wisp): PASS")
+
+    # --- Target stat drop chances ---
+    moonblast = FakeMove(
+        "moonblast", base_power=95, category=MoveCategory.SPECIAL,
+        type=PokemonType.FAIRY,
+        secondary=[{"chance": 30, "boosts": {"spa": -1}}],
+    )
+    spa_drop = dmg_builder._move_target_stat_drop_chance(moonblast, "spa")
+    assert abs(spa_drop - 0.3) < 0.01, f"Moonblast SpA drop: got {spa_drop}, expected 0.3"
+    spd_drop = dmg_builder._move_target_stat_drop_chance(moonblast, "spd")
+    assert spd_drop == 0.0, f"Moonblast SpD drop should be 0, got {spd_drop}"
+    print("  Target stat drop (Moonblast SpA -30%): PASS")
+
+    shadow_ball = FakeMove(
+        "shadowball", base_power=80, category=MoveCategory.SPECIAL,
+        type=PokemonType.GHOST,
+        secondary=[{"chance": 20, "boosts": {"spd": -1}}],
+    )
+    spd_drop_sb = dmg_builder._move_target_stat_drop_chance(shadow_ball, "spd")
+    assert abs(spd_drop_sb - 0.2) < 0.01, f"Shadow Ball SpD drop: got {spd_drop_sb}, expected 0.2"
+    print("  Target stat drop (Shadow Ball SpD -20%): PASS")
+
+    # --- Icy Wind: 100% speed drop ---
+    icy_wind = FakeMove(
+        "icywind", base_power=55, category=MoveCategory.SPECIAL,
+        type=PokemonType.ICE,
+        secondary=[{"chance": 100, "boosts": {"spe": -1}}],
+    )
+    spe_drop = dmg_builder._move_target_stat_drop_chance(icy_wind, "spe")
+    assert abs(spe_drop - 1.0) < 0.01, f"Icy Wind Spe drop: got {spe_drop}, expected 1.0"
+    print("  Target stat drop (Icy Wind Spe -100%): PASS")
+
+    # --- Serene Grace + target stat drops ---
+    spa_drop_sg = dmg_builder._move_target_stat_drop_chance(moonblast, "spa", attacker=sg_attacker)
+    assert abs(spa_drop_sg - 0.6) < 0.01, f"Serene Grace Moonblast SpA drop: got {spa_drop_sg}, expected 0.6"
+    print("  Serene Grace doubles target stat drop (30% -> 60%): PASS")
+
+    # --- Sheer Force zeroes target stat drops ---
+    spa_drop_sf = dmg_builder._move_target_stat_drop_chance(moonblast, "spa", attacker=sf_attacker)
+    assert spa_drop_sf == 0.0, f"Sheer Force SpA drop: got {spa_drop_sf}, expected 0.0"
+    print("  Sheer Force zeroes target stat drops: PASS")
+
+    # --- No attacker = backward compatible (no ability modification) ---
+    flinch_no_att = dmg_builder._move_effect_chance(air_slash, volatile_effect=Effect.FLINCH, attacker=None)
+    assert abs(flinch_no_att - 0.3) < 0.01, f"No attacker flinch: got {flinch_no_att}, expected 0.3"
+    print("  Backward compatible (attacker=None): PASS")
+
+    print("  All volatile effect + ability tests passed!")
+
+    print("\n== ALL TESTS PASSED ==")
 
 
 if __name__ == "__main__":

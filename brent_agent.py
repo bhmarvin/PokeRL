@@ -56,7 +56,7 @@ REWARD_CONFIG = {
 
 DECISION_AUDIT_SAMPLE_LIMIT = 20
 
-MOVE_BLOCK_SIZE = 25
+MOVE_BLOCK_SIZE = 36  # 25 base + 5 status-move + 6 volatile/secondary effect features
 MY_BENCH_SLOT_SIZE = 58  # was 53: +5 (best_ev, ohko, speed, max_incoming, hazard_entry)
 OPP_BENCH_SLOT_SIZE = 20
 BENCH_MOVE_FLAG_SIZE = 8
@@ -776,12 +776,26 @@ class BrentObservationVectorBuilder:
             expected_value,
         )
         vector[start + 18] = self._move_causes_recharge(move)
-        vector[start + 19] = self._move_effect_chance(move, statuses=(Status.BRN,))
-        vector[start + 20] = self._move_effect_chance(move, statuses=(Status.PAR,))
-        vector[start + 21] = self._move_effect_chance(move, statuses=(Status.PSN, Status.TOX))
-        vector[start + 22] = self._move_effect_chance(move, statuses=(Status.FRZ,))
-        vector[start + 23] = self._move_effect_chance(move, statuses=(Status.SLP,))
-        vector[start + 24] = self._move_effect_chance(move, volatile_effect=Effect.CONFUSION)
+        # Status effect chances (Serene Grace / Sheer Force aware)
+        vector[start + 19] = self._move_effect_chance(move, statuses=(Status.BRN,), attacker=attacker)
+        vector[start + 20] = self._move_effect_chance(move, statuses=(Status.PAR,), attacker=attacker)
+        vector[start + 21] = self._move_effect_chance(move, statuses=(Status.PSN, Status.TOX), attacker=attacker)
+        vector[start + 22] = self._move_effect_chance(move, statuses=(Status.FRZ,), attacker=attacker)
+        vector[start + 23] = self._move_effect_chance(move, statuses=(Status.SLP,), attacker=attacker)
+        vector[start + 24] = self._move_effect_chance(move, volatile_effect=Effect.CONFUSION, attacker=attacker)
+        # Status-move visibility features
+        vector[start + 25] = self._move_self_delta(move, "def")
+        vector[start + 26] = self._move_self_delta(move, "spd")
+        vector[start + 27] = self._move_is_setup(move)
+        vector[start + 28] = self._move_is_hazard(move)
+        vector[start + 29] = self._move_is_recovery(move)
+        # Volatile / secondary effect features (Serene Grace / Sheer Force aware)
+        vector[start + 30] = self._move_effect_chance(move, volatile_effect=Effect.FLINCH, attacker=attacker)
+        vector[start + 31] = self._move_target_stat_drop_chance(move, "def", attacker=attacker)
+        vector[start + 32] = self._move_target_stat_drop_chance(move, "spa", attacker=attacker)
+        vector[start + 33] = self._move_target_stat_drop_chance(move, "spd", attacker=attacker)
+        vector[start + 34] = self._move_target_stat_drop_chance(move, "spe", attacker=attacker)
+        vector[start + 35] = self._move_target_stat_drop_chance(move, "accuracy", attacker=attacker)
 
     def _fill_my_bench(self, vector: np.ndarray, battle: AbstractBattle) -> None:
         bench = [mon for mon in battle.team.values() if not mon.active][:5]
@@ -1370,53 +1384,286 @@ class BrentObservationVectorBuilder:
         def_stats: Dict[str, Optional[int]],
     ) -> Tuple[float, float]:
         # Robust Damage Formula (Generation 9)
+        # Modifiers drawn from poke_env.calc.damage_calc_gen9 but adapted for
+        # hypothetical stat sets (Bayesian role-weighted calcs).
         level = attacker.level or 80
         fixed_damage = self._fixed_damage_amount(attacker, defender, move, battle)
         if fixed_damage is not None:
             return fixed_damage, fixed_damage
 
         bp = float(getattr(move, "base_power", 0))
-        if bp == 0: bp = 5.0 # Min signal for status moves to differentiate types
-        
+        if bp == 0:
+            bp = 5.0  # Min signal for status moves to differentiate types
+
         category = move.category
+        is_body_press = move.id == "bodypress"
+        hits_physical = (
+            category == MoveCategory.PHYSICAL
+            or getattr(move, "entry", {}).get("overrideDefensiveStat", "") == "def"
+        )
         if category == MoveCategory.PHYSICAL:
-            a = float(att_stats.get("atk") or 100)
+            a = float(att_stats.get("def" if is_body_press else "atk") or 100)
             d = float(def_stats.get("def") or 100)
         else:
             a = float(att_stats.get("spa") or 100)
             d = float(def_stats.get("spd") or 100)
-            
+
+        # Foul Play uses defender's Attack
+        if move.id == "foulplay":
+            a = float(def_stats.get("atk") or 100)
+
         # Boosts
-        a_boost = _stat_stage_multiplier(attacker.boosts.get("atk" if category == MoveCategory.PHYSICAL else "spa", 0))
-        d_boost = _stat_stage_multiplier(defender.boosts.get("def" if category == MoveCategory.PHYSICAL else "spd", 0))
+        att_ability = getattr(attacker, "ability", None) or ""
+        def_ability = getattr(defender, "ability", None) or ""
+        if is_body_press:
+            a_boost = _stat_stage_multiplier(attacker.boosts.get("def", 0))
+        elif def_ability == "unaware":
+            a_boost = 1.0  # Unaware ignores offensive boosts
+        else:
+            a_boost = _stat_stage_multiplier(attacker.boosts.get("atk" if category == MoveCategory.PHYSICAL else "spa", 0))
+        if att_ability == "unaware" or getattr(move, "ignore_defensive", False):
+            d_boost = 1.0  # Unaware/Chip Away ignores defensive boosts
+        else:
+            d_boost = _stat_stage_multiplier(defender.boosts.get("def" if hits_physical else "spd", 0))
 
         a *= a_boost
         d *= d_boost
-        
-        # Base damage
-        base_damage = (((2 * level / 5 + 2) * bp * a / d) / 50) + 2
-        
-        # Modifiers
+
+        # Hustle: +50% physical attack, already baked into stat for our mons
+        if att_ability == "hustle" and category == MoveCategory.PHYSICAL:
+            a *= 1.5
+
+        # ---- Base power modifiers ----
+        bp_mult = 1.0
         move_type = self._resolve_move_type(attacker, move, battle)
+        try:
+            move_flags = set(move.flags)
+        except Exception:
+            move_flags = set()
+
+        # Ability-based BP modifiers (attacker)
+        if att_ability == "technician" and bp <= 60:
+            bp_mult *= 1.5
+        elif att_ability == "sheerforce" and (getattr(move, "secondary", None) or move.id == "orderup"):
+            bp_mult *= 1.3
+        elif att_ability == "toughclaws" and "contact" in move_flags:
+            bp_mult *= 1.3
+        elif att_ability == "strongjaw" and "bite" in move_flags:
+            bp_mult *= 1.5
+        elif att_ability == "megalauncher" and "pulse" in move_flags:
+            bp_mult *= 1.5
+        elif att_ability == "sharpness" and "slicing" in move_flags:
+            bp_mult *= 1.5
+        elif att_ability == "punkrock" and "sound" in move_flags:
+            bp_mult *= 1.3
+        elif att_ability == "ironfist" and "punch" in move_flags:
+            bp_mult *= 1.2
+        elif att_ability == "reckless" and getattr(move, "recoil", 0) > 0:
+            bp_mult *= 1.2
+        elif att_ability == "sandforce" and Weather.SANDSTORM in battle.weather and move_type in (PokemonType.ROCK, PokemonType.GROUND, PokemonType.STEEL):
+            bp_mult *= 1.3
+
+        # Terrain BP boosts (grounded attacker)
+        is_grounded_att = not (PokemonType.FLYING in getattr(attacker, "types", ()) or att_ability == "levitate")
+        if is_grounded_att:
+            if Field.ELECTRIC_TERRAIN in battle.fields and move_type == PokemonType.ELECTRIC:
+                bp_mult *= 1.3
+            elif Field.GRASSY_TERRAIN in battle.fields and move_type == PokemonType.GRASS:
+                bp_mult *= 1.3
+            elif Field.PSYCHIC_TERRAIN in battle.fields and move_type == PokemonType.PSYCHIC:
+                bp_mult *= 1.3
+
+        # Terrain BP reductions (grounded defender)
+        is_grounded_def = not (PokemonType.FLYING in getattr(defender, "types", ()) or def_ability == "levitate")
+        if is_grounded_def:
+            if Field.MISTY_TERRAIN in battle.fields and move_type == PokemonType.DRAGON:
+                bp_mult *= 0.5
+            elif Field.GRASSY_TERRAIN in battle.fields and move.id in ("bulldoze", "earthquake"):
+                bp_mult *= 0.5
+
+        # Move-specific BP doublings
+        if (
+            (move.id == "facade" and attacker.status in (Status.BRN, Status.PAR, Status.PSN, Status.TOX))
+            or (move.id == "brine" and _safe_hp_fraction(defender) <= 0.5)
+            or (move.id == "venoshock" and defender.status in (Status.PSN, Status.TOX))
+            or (move.id == "hex" and defender.status is not None)
+        ):
+            bp_mult *= 2.0
+        elif move.id == "knockoff" and defender.item is not None:
+            bp_mult *= 1.5
+
+        # Dry Skin takes 25% extra from Fire
+        if def_ability == "dryskin" and move_type == PokemonType.FIRE:
+            bp_mult *= 1.25
+
+        bp *= bp_mult
+
+        # ---- Attack stat modifiers ----
+        atk_mult = 1.0
+        # Choice items
+        att_item = getattr(attacker, "item", None) or ""
+        if att_item == "choiceband" and category == MoveCategory.PHYSICAL:
+            atk_mult *= 1.5
+        elif att_item == "choicespecs" and category == MoveCategory.SPECIAL:
+            atk_mult *= 1.5
+
+        # Guts overrides burn penalty and boosts physical
+        if att_ability == "guts" and attacker.status is not None and category == MoveCategory.PHYSICAL:
+            atk_mult *= 1.5
+        # Pinch abilities (Overgrow, Blaze, Torrent, Swarm)
+        elif _safe_hp_fraction(attacker) <= 1.0 / 3:
+            if (att_ability == "overgrow" and move_type == PokemonType.GRASS) or \
+               (att_ability == "blaze" and move_type == PokemonType.FIRE) or \
+               (att_ability == "torrent" and move_type == PokemonType.WATER) or \
+               (att_ability == "swarm" and move_type == PokemonType.BUG):
+                atk_mult *= 1.5
+
+        # Flash Fire
+        if att_ability == "flashfire" and Effect.FLASH_FIRE in getattr(attacker, "effects", {}) and move_type == PokemonType.FIRE:
+            atk_mult *= 1.5
+
+        # Huge Power / Pure Power
+        if att_ability in ("hugepower", "purepower") and category == MoveCategory.PHYSICAL:
+            atk_mult *= 2.0
+
+        # Water Bubble (water moves)
+        if att_ability == "waterbubble" and move_type == PokemonType.WATER:
+            atk_mult *= 2.0
+
+        # Solar Power (special in sun)
+        if att_ability == "solarpower" and Weather.SUNNYDAY in battle.weather and category == MoveCategory.SPECIAL:
+            atk_mult *= 1.5
+
+        # Gorilla Tactics (physical)
+        if att_ability == "gorillatactics" and category == MoveCategory.PHYSICAL:
+            atk_mult *= 1.5
+
+        # Type-boosting abilities (Steelworker, Dragon's Maw, Rocky Payload)
+        if (att_ability == "steelworker" and move_type == PokemonType.STEEL) or \
+           (att_ability == "dragonsmaw" and move_type == PokemonType.DRAGON) or \
+           (att_ability == "rockypayload" and move_type == PokemonType.ROCK):
+            atk_mult *= 1.5
+        elif att_ability == "transistor" and move_type == PokemonType.ELECTRIC:
+            atk_mult *= 1.3
+
+        # Thick Fat (defender, reduces Fire/Ice attack)
+        if def_ability == "thickfat" and move_type in (PokemonType.FIRE, PokemonType.ICE):
+            atk_mult *= 0.5
+        # Water Bubble (defender, reduces Fire attack)
+        elif def_ability == "waterbubble" and move_type == PokemonType.FIRE:
+            atk_mult *= 0.5
+        # Heatproof
+        elif def_ability == "heatproof" and move_type == PokemonType.FIRE:
+            atk_mult *= 0.5
+
+        a *= atk_mult
+
+        # ---- Defense stat modifiers ----
+        def_mult = 1.0
+        def_item = getattr(defender, "item", None) or ""
+
+        # Sandstorm SpD boost for Rock types
+        if Weather.SANDSTORM in battle.weather and PokemonType.ROCK in getattr(defender, "types", ()) and not hits_physical:
+            def_mult *= 1.5
+        # Snow Def boost for Ice types
+        if Weather.SNOW in battle.weather and PokemonType.ICE in getattr(defender, "types", ()) and hits_physical:
+            def_mult *= 1.5
+
+        # Eviolite
+        if def_item == "eviolite":
+            def_mult *= 1.5
+        # Assault Vest (SpD only)
+        elif def_item == "assaultvest" and not hits_physical:
+            def_mult *= 1.5
+
+        # Fur Coat (physical defense doubled)
+        if def_ability == "furcoat" and hits_physical:
+            def_mult *= 2.0
+        # Ice Scales (special defense halved incoming)
+        elif def_ability == "icescales" and not hits_physical:
+            def_mult *= 2.0
+        # Marvel Scale
+        elif def_ability == "marvelscale" and defender.status is not None and hits_physical:
+            def_mult *= 1.5
+
+        d *= def_mult
+
+        # ---- Base damage ----
+        base_damage = (((2 * level / 5 + 2) * bp * a / d) / 50) + 2
+
+        # ---- Final modifiers ----
         type_mult = _defender_type_mult(move_type, defender, self._gen_data.type_chart)
         stab = _stab_multiplier(attacker, move_type)
-        
-        # Weather/Burn
+
+        # Adaptability (already partially handled in _stab_multiplier for tera,
+        # but non-tera adaptability gives 2.0x STAB)
+        if att_ability == "adaptability" and not getattr(attacker, "is_terastallized", False):
+            if move_type in attacker.types:
+                stab = 2.0
+
+        # Weather
         weather_mult = 1.0
-        if move_type == PokemonType.FIRE:
-            if Weather.SUNNYDAY in battle.weather: weather_mult = 1.5
-            elif Weather.RAINDANCE in battle.weather: weather_mult = 0.5
-        elif move_type == PokemonType.WATER:
-            if Weather.RAINDANCE in battle.weather: weather_mult = 1.5
-            elif Weather.SUNNYDAY in battle.weather: weather_mult = 0.5
-            
-        burn_mult = 0.5 if (attacker.status == Status.BRN and category == MoveCategory.PHYSICAL) else 1.0
-        
-        total_mult = type_mult * stab * weather_mult * burn_mult
-        
+        att_umbrella = att_item == "utilityumbrella"
+        def_umbrella = def_item == "utilityumbrella"
+        if not def_umbrella:
+            if move_type == PokemonType.FIRE:
+                if Weather.SUNNYDAY in battle.weather:
+                    weather_mult = 1.5
+                elif Weather.RAINDANCE in battle.weather:
+                    weather_mult = 0.5
+            elif move_type == PokemonType.WATER:
+                if Weather.RAINDANCE in battle.weather:
+                    weather_mult = 1.5
+                elif Weather.SUNNYDAY in battle.weather:
+                    weather_mult = 0.5
+        # Hydro Steam special case
+        if move.id == "hydrosteam" and Weather.SUNNYDAY in battle.weather and not att_umbrella:
+            weather_mult = 1.5
+
+        # Burn (Guts prevents burn penalty)
+        burn_mult = 1.0
+        if attacker.status == Status.BRN and category == MoveCategory.PHYSICAL:
+            if att_ability != "guts" and move.id != "facade":
+                burn_mult = 0.5
+
+        # Screens
+        screen_mult = 1.0
+        def_side = getattr(battle, "side_conditions", {}) if defender == battle.active_pokemon else getattr(battle, "opponent_side_conditions", {})
+        if SideCondition.AURORA_VEIL in def_side:
+            screen_mult = 0.5
+        elif SideCondition.REFLECT in def_side and hits_physical:
+            screen_mult = 0.5
+        elif SideCondition.LIGHT_SCREEN in def_side and not hits_physical:
+            screen_mult = 0.5
+
+        # Solid Rock / Filter / Prism Armor
+        if def_ability in ("solidrock", "filter", "prismarmor") and type_mult > 1.0:
+            type_mult *= 0.75
+
+        # Multiscale / Shadow Shield (full HP)
+        if def_ability in ("multiscale", "shadowshield") and _safe_hp_fraction(defender) >= 1.0:
+            screen_mult *= 0.5
+
+        # Tinted Lens (attacker, resisted moves hit harder)
+        tinted = 1.0
+        if att_ability == "tintedlens" and type_mult < 1.0:
+            tinted = 2.0
+        # Neuroforce (super-effective bonus)
+        elif att_ability == "neuroforce" and type_mult > 1.0:
+            tinted = 1.25
+
+        # Item final modifiers
+        item_mult = 1.0
+        if att_item == "lifeorb":
+            item_mult = 1.3
+        elif att_item == "expertbelt" and type_mult > 1.0:
+            item_mult = 1.2
+
+        total_mult = type_mult * stab * weather_mult * burn_mult * screen_mult * tinted * item_mult
+
         final_min = base_damage * total_mult * 0.85
         final_max = base_damage * total_mult * 1.0
-        
+
         return final_min, final_max
 
     def _fixed_damage_amount(
@@ -1630,15 +1877,75 @@ class BrentObservationVectorBuilder:
             return 1.0
         return 1.0 if bool(getattr(move, "recharge", False)) else 0.0
 
+    # ---------- Status-move visibility helpers (move block 25-29) ----------
+
+    _SETUP_MOVES: set[str] = {
+        "swordsdance", "nastyplot", "dragondance", "calmmind", "quiverdance",
+        "shellsmash", "irondefense", "amnesia", "bulkup", "coil",
+        "honeclaws", "workup", "tidyup", "tailglow", "growth",
+        "agility", "autotomize", "rockpolish", "shiftgear", "cottonguard",
+        "cosmicpower", "acidarmor", "barrier", "curse", "bellydrum",
+        "filletaway", "victorydance", "clangoroussoul", "noretreat",
+        "geomancy", "extremeevoboost",
+    }
+    _HAZARD_MOVES: set[str] = {
+        "stealthrock", "spikes", "toxicspikes", "stickyweb", "cometshards",
+    }
+    _RECOVERY_MOVES: set[str] = {
+        "recover", "roost", "softboiled", "moonlight", "morningsun",
+        "synthesis", "slackoff", "milkdrink", "wish", "healorder",
+        "shoreup", "junglehealing", "lifedew", "lunarblessing",
+        "rest", "healingwish", "lunardance", "strengthsap",
+    }
+
+    def _move_is_setup(self, move: Move) -> float:
+        """1.0 if the move is a stat-boosting setup move."""
+        if move.id in self._SETUP_MOVES:
+            return 1.0
+        # Fallback: any move with net positive self-boosts and no damage
+        try:
+            boosts = getattr(move, "self_boost", None)
+        except Exception:
+            boosts = None
+        if not isinstance(boosts, dict):
+            entry = getattr(move, "entry", {}) or {}
+            if isinstance(entry.get("selfBoost"), dict):
+                boosts = entry["selfBoost"].get("boosts")
+            elif isinstance(entry.get("self"), dict):
+                boosts = entry["self"].get("boosts")
+        if isinstance(boosts, dict) and sum(boosts.values()) > 0 and float(getattr(move, "base_power", 0)) == 0:
+            return 1.0
+        return 0.0
+
+    def _move_is_hazard(self, move: Move) -> float:
+        """1.0 if the move sets entry hazards."""
+        return 1.0 if move.id in self._HAZARD_MOVES else 0.0
+
+    def _move_is_recovery(self, move: Move) -> float:
+        """1.0 if the move is a dedicated recovery move."""
+        if move.id in self._RECOVERY_MOVES:
+            return 1.0
+        # Also flag moves with significant self-healing and no damage
+        heal = float(getattr(move, "heal", 0.0) or 0.0)
+        if heal >= 0.25 and float(getattr(move, "base_power", 0)) == 0:
+            return 1.0
+        return 0.0
+
     def _move_effect_chance(
         self,
         move: Move,
         *,
         statuses: Tuple[Status, ...] = (),
         volatile_effect: Optional[Effect] = None,
+        attacker: Optional[Pokemon] = None,
     ) -> float:
+        att_ability = (getattr(attacker, "ability", None) or "").lower().replace(" ", "") if attacker else ""
+        is_serene = att_ability == "serenegrace"
+        is_sheer = att_ability == "sheerforce"
+
         best = 0.0
 
+        # Direct status/volatile (100% guaranteed, not secondary — unaffected by abilities)
         direct_status = getattr(move, "status", None)
         if direct_status in statuses:
             best = 1.0
@@ -1646,6 +1953,10 @@ class BrentObservationVectorBuilder:
         entry = getattr(move, "entry", {}) or {}
         if volatile_effect is not None and self._entry_effect(entry.get("volatileStatus")) == volatile_effect:
             best = 1.0
+
+        # Sheer Force removes secondary effects entirely (but not direct status above)
+        if is_sheer:
+            return best
 
         secondary_effects = getattr(move, "secondary", None)
         if not isinstance(secondary_effects, list):
@@ -1660,9 +1971,49 @@ class BrentObservationVectorBuilder:
             if not isinstance(secondary, dict):
                 continue
             chance = _clamp01(float(secondary.get("chance", 100)) / 100.0)
+            if is_serene:
+                chance = min(chance * 2.0, 1.0)
             if self._entry_status(secondary.get("status")) in statuses:
                 best = max(best, chance)
             if volatile_effect is not None and self._entry_effect(secondary.get("volatileStatus")) == volatile_effect:
+                best = max(best, chance)
+        return best
+
+    def _move_target_stat_drop_chance(
+        self,
+        move: Move,
+        stat: str,
+        attacker: Optional[Pokemon] = None,
+    ) -> float:
+        """Return the chance (0-1) that this move drops the target's stat."""
+        att_ability = (getattr(attacker, "ability", None) or "").lower().replace(" ", "") if attacker else ""
+        if att_ability == "sheerforce":
+            return 0.0
+
+        is_serene = att_ability == "serenegrace"
+        entry = getattr(move, "entry", {}) or {}
+
+        secondary_effects = getattr(move, "secondary", None)
+        if not isinstance(secondary_effects, list):
+            if isinstance(entry.get("secondary"), dict):
+                secondary_effects = [entry["secondary"]]
+            elif isinstance(entry.get("secondaries"), list):
+                secondary_effects = entry["secondaries"]
+            else:
+                secondary_effects = []
+
+        best = 0.0
+        for secondary in secondary_effects:
+            if not isinstance(secondary, dict):
+                continue
+            boosts = secondary.get("boosts")
+            if not isinstance(boosts, dict):
+                continue
+            drop = boosts.get(stat, 0)
+            if drop < 0:  # negative = target stat drop
+                chance = _clamp01(float(secondary.get("chance", 100)) / 100.0)
+                if is_serene:
+                    chance = min(chance * 2.0, 1.0)
                 best = max(best, chance)
         return best
 
@@ -3022,6 +3373,17 @@ class BrentsRLAgent(SinglesEnv):
                 "frz": round(float(block[22]), 3),
                 "slp": round(float(block[23]), 3),
                 "conf": round(float(block[24]), 3),
+                "self_def_delta": round(float(block[25]), 3),
+                "self_spd_delta": round(float(block[26]), 3),
+                "is_setup": int(block[27]),
+                "is_hazard": int(block[28]),
+                "is_recovery": int(block[29]),
+                "flinch": round(float(block[30]), 3),
+                "tgt_def_drop": round(float(block[31]), 3),
+                "tgt_spa_drop": round(float(block[32]), 3),
+                "tgt_spd_drop": round(float(block[33]), 3),
+                "tgt_spe_drop": round(float(block[34]), 3),
+                "tgt_acc_drop": round(float(block[35]), 3),
             }
         return {"move_id": chosen_move.id, "slot": None}
 

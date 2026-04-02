@@ -4,7 +4,7 @@ PokeRL is a reinforcement-learning project built on top of `poke_env` and Stable
 
 The project focuses on:
 
-- a 684-dim structured observation tensor with battle-state, move-value, bench matchup, targeting, and theory-of-mind features
+- a 728-dim structured observation tensor with battle-state, move-value, bench matchup, targeting, and theory-of-mind features
 - a structured feature extractor that processes semantic blocks (active mons, moves, bench slots, threats) through shared-weight encoders before feeding a [256,128] MLP
 - reward shaping on top of `poke_env`'s state-delta helper with tactical levers
 - masked PPO so the policy never assigns probability mass to illegal actions
@@ -13,15 +13,15 @@ The project focuses on:
 
 ## Main Files
 
-- `brent_agent.py`: observation vector (684 dims), reward shaping, damage estimation, type/ability mechanics, tactical lever evaluation
+- `brent_agent.py`: observation vector (728 dims), reward shaping, damage estimation, type/ability mechanics, tactical lever evaluation
 - `train_ppo.py`: training entry point, checkpoint loading, eval callback, summary writing
 - `policies.py`: structured observation extractor (9 semantic block encoders) and masked PPO policy
 - `opponents.py`: opponent selection (`random`, `max_base_power`, `simple_heuristic`)
 - `randbats_data.py`: randbats role priors and stat inference
-- `test_runner.py`: observation vector, tera, and reward lever tests
+- `test_runner.py`: observation vector, tera, damage calc, volatile effect, and reward lever tests
 - `inspect_battle_debug.py`: interactive battle and embedding inspector
 
-## Observation Vector (684 dims)
+## Observation Vector (728 dims)
 
 | Block | Size | Description |
 |-------|------|-------------|
@@ -29,11 +29,53 @@ The project focuses on:
 | My Active | 60 | HP, types, boosts, status, volatiles, items, tera (type + flags) |
 | Opp Active | 41 | HP, types, boosts, status, volatiles, items, tera flag |
 | Speed | 1 | Speed advantage vs opponent active |
-| My Moves (4x25) | 100 | Damage range, accuracy, EV, KO flag, STAB, category, effects |
+| My Moves (4x36) | 144 | Damage range, accuracy, EV, KO flag, STAB, category, effects, setup/hazard/recovery flags, flinch, target stat drops |
 | My Bench (5x58) | 290 | HP, types, move flags, intimidate, offensive matchup vs opp active (best EV, OHKO, speed), defensive matchup (max incoming), hazard entry damage |
 | Opp Bench (5x20) | 100 | Revealed flag, HP, types |
 | Targeting (4x5) | 20 | My moves damage EV vs each opp bench slot |
 | Threat/Meta | 48 | Team revealed, opp threat rows (4 moves x EV vs team), OHKO risk, role confidence, recharge, alive count diff |
+
+### Move Block Detail (36 features per move)
+
+| Index | Feature | Range |
+|-------|---------|-------|
+| 0-1 | Damage range (min%, max%) | [0, 1] |
+| 2 | Accuracy | [0, 1] |
+| 3 | Expected value (avg damage x accuracy) | [0, 1] |
+| 4 | KO flag (max_pct >= remaining HP) | {0, 1} |
+| 5 | STAB | {0, 1} |
+| 6-7 | Category (physical, special) | {0, 1} |
+| 8-9 | Flags (contact, sound) | {0, 1} |
+| 10 | Priority move | {0, 1} |
+| 11 | Pivot move (U-turn, Volt Switch) | {0, 1} |
+| 12 | Heal amount | [0, 1] |
+| 13 | Drain ratio | [0, 1] |
+| 14-16 | Self stat deltas (atk, spa, spe) | [-1, 1] |
+| 17 | Recoil fraction | [0, 1] |
+| 18 | Recharge flag | {0, 1} |
+| 19-24 | Status chances (brn, par, psn, frz, slp, confusion) | [0, 1] |
+| 25-26 | Self stat deltas (def, spd) | [-1, 1] |
+| 27 | Is setup move (Swords Dance, Calm Mind, etc.) | {0, 1} |
+| 28 | Is hazard move (Stealth Rock, Spikes, etc.) | {0, 1} |
+| 29 | Is recovery move (Recover, Roost, etc.) | {0, 1} |
+| 30 | Flinch chance | [0, 1] |
+| 31-35 | Target stat drop chances (def, spa, spd, spe, accuracy) | [0, 1] |
+
+Status/flinch/stat-drop chances are **ability-aware**: Serene Grace doubles secondary chances; Sheer Force zeroes them.
+
+## Damage Calculator
+
+The manual damage calculator (`_manual_damage_calc`) implements the Gen 9 damage formula with Bayesian role-weighted stat inference for opponent Pokemon. Modifier coverage includes:
+
+**Base Power:** Technician, Sheer Force, Tough Claws, Strong Jaw, Mega Launcher, Sharpness, Punk Rock, Iron Fist, Reckless, Sand Force, terrain boosts (Electric/Grassy/Psychic), terrain reductions (Misty/Grassy), move-specific (Facade, Brine, Venoshock, Hex, Knockoff), Dry Skin
+
+**Attack Stat:** Choice Band/Specs, Guts, Huge Power/Pure Power, Water Bubble, Solar Power, Gorilla Tactics, Steelworker/Dragon's Maw/Rocky Payload, Transistor, Flash Fire, pinch abilities (Overgrow/Blaze/Torrent/Swarm), Thick Fat/Heatproof (defender)
+
+**Defense Stat:** Sandstorm SpD (Rock types), Snow Def (Ice types), Eviolite, Assault Vest, Fur Coat, Ice Scales, Marvel Scale
+
+**Final Modifiers:** STAB (including tera + Adaptability), weather (with Utility Umbrella), burn (with Guts/Facade exceptions), screens (Reflect/Light Screen/Aurora Veil), Solid Rock/Filter/Prism Armor, Multiscale/Shadow Shield, Tinted Lens, Neuroforce, Life Orb, Expert Belt
+
+**Special Moves:** Body Press (uses Def stat), Foul Play (uses target's Atk), Unaware (ignores boosts), Hustle, Hydro Steam
 
 ## Structured Extractor
 
@@ -56,7 +98,7 @@ Tactical levers (penalties/bonuses applied per-decision):
 | heal_satiation | -0.1 | 3+ consecutive heals on same mon |
 | wasted_free_switch | -0.1 | Switching out immediately after entering via faint (next turn only) |
 | redundant_hazards | -0.1 | Setting hazards already on field |
-| redundant_self_drop | -0.1 | Using self-stat-drop move at -2 when better option exists |
+| redundant_self_drop | -0.1 | Using self-stat-drop move when better option exists |
 
 ## Training
 
@@ -103,4 +145,4 @@ Use the inspector to step through live battles and compare embedding values:
 .\venv\Scripts\python.exe test_runner.py
 ```
 
-Tests cover: observation vector shape and content, tera observation encoding, tera immunity reward, tera damage calcs, and reward lever assertions.
+Tests cover: observation vector shape and content, tera observation encoding, tera immunity reward, tera damage calcs, damage calc modifiers (17 tests covering abilities/items/terrain/screens/weather), move block features (setup/hazard/recovery), volatile effects (flinch/stat drops with Serene Grace/Sheer Force awareness), and reward lever assertions.
