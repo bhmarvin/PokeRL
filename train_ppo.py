@@ -342,7 +342,10 @@ class PokeEnvEvalCallback(BaseCallback):
                         break
                     except OSError:
                         time.sleep(0.5)
-                        env.close()
+                        try:
+                            env.close()
+                        except OSError:
+                            pass
                         env = create_wrapped_env(self.args, self.args.eval_opponent)
                 else:
                     print(f"  [eval] skipping episode {ep} — could not reset env")
