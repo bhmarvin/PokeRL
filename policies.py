@@ -23,6 +23,7 @@ from brent_agent import (
     TARGETING_START,
     MY_TEAM_REVEALED_START,
     ON_RECHARGE_INDEX,
+    ALIVE_DIFF_INDEX,
 )
 
 # Block boundaries (derived from brent_agent constants)
@@ -31,23 +32,23 @@ _MY_ACTIVE_END = OPP_ACTIVE_START                      # 24:84
 _OPP_ACTIVE_END = SPEED_ADVANTAGE_INDEX                # 84:125
 _SPEED_END = SPEED_ADVANTAGE_INDEX + 1                 # 125:126
 _MOVES_END = MY_BENCH_START                            # 126:226
-_MY_BENCH_END = OPP_BENCH_START                        # 226:491
-_OPP_BENCH_END = TARGETING_START                       # 491:591
-_TARGETING_END = MY_TEAM_REVEALED_START                # 591:611
-_THREAT_END = ON_RECHARGE_INDEX + 1                    # 611:658
+_MY_BENCH_END = OPP_BENCH_START                        # 226:516
+_OPP_BENCH_END = TARGETING_START                       # 516:616
+_TARGETING_END = MY_TEAM_REVEALED_START                # 616:636
+_THREAT_END = ALIVE_DIFF_INDEX + 1                     # 636:684
 
 # Block sizes
 _GLOBAL_SIZE = _GLOBAL_END                             # 24
 _MY_ACTIVE_SIZE = MY_ACTIVE_BLOCK_SIZE                 # 60
 _OPP_ACTIVE_SIZE = OPP_ACTIVE_BLOCK_SIZE               # 41
 _TARGETING_SIZE = _TARGETING_END - TARGETING_START      # 20
-_THREAT_SIZE = _THREAT_END - _TARGETING_END             # 47
+_THREAT_SIZE = _THREAT_END - _TARGETING_END             # 48 (was 47, +1 alive_diff)
 
 
 class StructuredObservationExtractor(BaseFeaturesExtractor):
     """Structured feature extractor that processes semantic blocks separately.
 
-    The 658-dim observation vector is sliced into 9 semantic blocks:
+    The observation vector is sliced into 9 semantic blocks:
     global state, my active, opp active, speed, moves(×4), my bench(×5),
     opp bench(×5), targeting matrix, and threat/meta features.
 
@@ -108,7 +109,7 @@ class StructuredObservationExtractor(BaseFeaturesExtractor):
         return ((x - self.running_mean) / std).clamp(-10.0, 10.0)
 
     def forward(self, obs: dict[str, th.Tensor]) -> th.Tensor:
-        x = self._welford_normalize(obs["observation"])  # (batch, 658)
+        x = self._welford_normalize(obs["observation"])  # (batch, VECTOR_LENGTH)
 
         # Slice and encode each semantic block
         global_f = self.global_enc(x[:, :_GLOBAL_END])
@@ -124,7 +125,7 @@ class StructuredObservationExtractor(BaseFeaturesExtractor):
             move_embeds.append(self.move_enc(x[:, start:end]))
         moves_f = th.cat(move_embeds, dim=1)  # (batch, 128)
 
-        # Shared my-bench encoder: 5 slots × 53 features each
+        # Shared my-bench encoder: 5 slots × MY_BENCH_SLOT_SIZE features each
         my_bench_embeds = []
         for i in range(5):
             start = MY_BENCH_START + i * MY_BENCH_SLOT_SIZE

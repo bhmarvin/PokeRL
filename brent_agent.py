@@ -56,9 +56,8 @@ REWARD_CONFIG = {
 
 DECISION_AUDIT_SAMPLE_LIMIT = 20
 
-VECTOR_LENGTH = 658
 MOVE_BLOCK_SIZE = 25
-MY_BENCH_SLOT_SIZE = 53
+MY_BENCH_SLOT_SIZE = 58  # was 53: +5 (best_ev, ohko, speed, max_incoming, hazard_entry)
 OPP_BENCH_SLOT_SIZE = 20
 BENCH_MOVE_FLAG_SIZE = 8
 OPP_THREAT_ROWS = 4
@@ -77,14 +76,16 @@ OPP_ACTIVE_START = MY_ACTIVE_START + MY_ACTIVE_BLOCK_SIZE  # 84
 SPEED_ADVANTAGE_INDEX = OPP_ACTIVE_START + OPP_ACTIVE_BLOCK_SIZE  # 125
 MY_MOVES_START = SPEED_ADVANTAGE_INDEX + 1  # 126
 MY_BENCH_START = MY_MOVES_START + 4 * MOVE_BLOCK_SIZE  # 226
-OPP_BENCH_START = MY_BENCH_START + 5 * MY_BENCH_SLOT_SIZE  # 486
-TARGETING_START = OPP_BENCH_START + 5 * OPP_BENCH_SLOT_SIZE  # 586
-MY_TEAM_REVEALED_START = TARGETING_START + 20  # 606
-OPP_THREAT_START = MY_TEAM_REVEALED_START + 6  # 612
+OPP_BENCH_START = MY_BENCH_START + 5 * MY_BENCH_SLOT_SIZE  # 516
+TARGETING_START = OPP_BENCH_START + 5 * OPP_BENCH_SLOT_SIZE  # 616
+MY_TEAM_REVEALED_START = TARGETING_START + 20  # 636
+OPP_THREAT_START = MY_TEAM_REVEALED_START + 6  # 642
 OPP_MOVES_VS_ME_START = OPP_THREAT_START + 2
 OPP_THREAT_OHKO_START = OPP_THREAT_START + OPP_THREAT_ROWS * OPP_THREAT_ROW_SIZE
 OPP_THREAT_CONFIDENCE_START = OPP_THREAT_OHKO_START + 6
 ON_RECHARGE_INDEX = OPP_THREAT_CONFIDENCE_START + 2
+ALIVE_DIFF_INDEX = ON_RECHARGE_INDEX + 1
+VECTOR_LENGTH = ALIVE_DIFF_INDEX + 1
 
 TYPE_ORDER = (
     PokemonType.BUG,
@@ -362,6 +363,10 @@ class BrentObservationVectorBuilder:
             self._fill_targeting_matrix(vector, battle)
             self._fill_opponent_threat_features(vector, battle)
             vector[ON_RECHARGE_INDEX] = self._on_recharge(battle.active_pokemon)
+            # Alive count differential: (my_alive - opp_alive) / 6, range [-1, 1]
+            my_alive = sum(1 for m in battle.team.values() if not m.fainted)
+            opp_alive = sum(1 for m in battle.opponent_team.values() if not m.fainted)
+            vector[ALIVE_DIFF_INDEX] = (my_alive - opp_alive) / 6.0
             return vector
         finally:
             self._damage_cache.clear()
@@ -780,6 +785,14 @@ class BrentObservationVectorBuilder:
 
     def _fill_my_bench(self, vector: np.ndarray, battle: AbstractBattle) -> None:
         bench = [mon for mon in battle.team.values() if not mon.active][:5]
+        opponent = battle.opponent_active_pokemon
+        opp_posterior = (
+            self._opponent_role_posterior(opponent) if opponent is not None else None
+        )
+        opp_speed = (
+            self._effective_speed(opponent, battle.opponent_side_conditions, role_posterior=opp_posterior)
+            if opponent is not None else None
+        )
         for slot, mon in enumerate(bench):
             start = MY_BENCH_START + slot * MY_BENCH_SLOT_SIZE
             vector[start] = 0.0 if mon.fainted else 1.0
@@ -791,6 +804,79 @@ class BrentObservationVectorBuilder:
             # Ability flag: Intimidate
             ability = getattr(mon, "ability", None)
             vector[start + 52] = 1.0 if ability and ability.lower().replace(" ", "") == "intimidate" else 0.0
+            # Offensive matchup features vs opponent active
+            self._fill_bench_matchup(vector, start + 53, mon, battle, opponent, opp_speed, opp_posterior)
+
+    def _fill_bench_matchup(
+        self,
+        vector: np.ndarray,
+        start: int,
+        mon: Pokemon,
+        battle: AbstractBattle,
+        opponent: Optional[Pokemon],
+        opp_speed: Optional[float],
+        opp_posterior: Optional[Dict[str, float]],
+    ) -> None:
+        """Fill per-bench-slot matchup features vs opponent active.
+        [53] best_move_ev  - best move's expected damage % vs opponent
+        [54] can_ohko       - 1.0 if best move can KO opponent
+        [55] outspeeds      - 1.0 if this bench mon outspeeds opponent
+        [56] max_incoming   - max damage % opponent can do to this bench mon
+        [57] hazard_entry   - % HP lost on switch-in from hazards
+        """
+        if mon.fainted or opponent is None:
+            return
+
+        # Offensive: best move EV and OHKO flag
+        best_ev = 0.0
+        can_ohko = False
+        opp_hp = _safe_hp_fraction(opponent)
+        for move in mon.moves.values():
+            if self._move_category(move) == MoveCategory.STATUS:
+                continue
+            min_pct, max_pct = self._damage_range_percent(
+                battle, mon, opponent, move,
+                battle.player_role, battle.opponent_role,
+            )
+            ev = _clamp01(((min_pct + max_pct) / 2.0) * _clamp01(float(move.accuracy)))
+            if ev > best_ev:
+                best_ev = ev
+            if opp_hp > 0.0 and max_pct >= opp_hp:
+                can_ohko = True
+        vector[start] = _clamp01(best_ev)
+        vector[start + 1] = 1.0 if can_ohko else 0.0
+
+        # Speed comparison
+        mon_speed = self._effective_speed(mon, battle.side_conditions)
+        if mon_speed is not None and opp_speed is not None:
+            vector[start + 2] = 1.0 if mon_speed > opp_speed else 0.0
+        else:
+            vector[start + 2] = 0.5  # unknown
+
+        # Defensive: max incoming damage from opponent's moves
+        max_incoming = 0.0
+        if opp_posterior is not None:
+            threat_entries = self._select_opponent_threat_entries(opponent, opp_posterior)
+            for entry in threat_entries:
+                ev = self._move_expected_value(
+                    battle, opponent, mon,
+                    entry.move, battle.opponent_role, battle.player_role,
+                )
+                if ev > max_incoming:
+                    max_incoming = ev
+        else:
+            for opp_move in opponent.moves.values():
+                min_pct, max_pct = self._damage_range_percent(
+                    battle, opponent, mon, opp_move,
+                    battle.opponent_role, battle.player_role,
+                )
+                ev = _clamp01(((min_pct + max_pct) / 2.0) * _clamp01(float(opp_move.accuracy)))
+                if ev > max_incoming:
+                    max_incoming = ev
+        vector[start + 3] = _clamp01(max_incoming)
+
+        # Hazard entry damage
+        vector[start + 4] = self._hazard_entry_damage(mon, battle.side_conditions)
 
     def _fill_bench_move_flags(
         self,
@@ -1165,6 +1251,35 @@ class BrentObservationVectorBuilder:
         if Effect.MUST_RECHARGE in mon.effects:
             return 1.0
         return 1.0 if bool(getattr(mon, "must_recharge", False)) else 0.0
+
+    def _hazard_entry_damage(self, mon: Pokemon, side_conditions: Dict[SideCondition, int]) -> float:
+        """Estimate fraction of HP lost when switching this mon in due to hazards."""
+        # Heavy-Duty Boots block all entry hazards
+        item = getattr(mon, "item", None)
+        if item and item.lower().replace(" ", "").replace("-", "") == "heavydutyboots":
+            return 0.0
+        damage = 0.0
+        # Stealth Rock: type-based (0.5x to 4x of 12.5%)
+        if SideCondition.STEALTH_ROCK in side_conditions:
+            rock_type = PokemonType.ROCK
+            types = _effective_types(mon)
+            mult = 1.0
+            type_chart = self._gen_data.type_chart if hasattr(self, "_gen_data") else None
+            if type_chart is not None:
+                for t in types:
+                    if t is not None:
+                        mult *= rock_type.damage_multiplier(t, None, type_chart=type_chart)
+            damage += 0.125 * mult
+        # Spikes: layers (1=12.5%, 2=16.7%, 3=25%)
+        spikes = side_conditions.get(SideCondition.SPIKES, 0)
+        if spikes > 0:
+            types = _effective_types(mon)
+            is_flying = any(t == PokemonType.FLYING for t in types if t is not None)
+            is_levitate = _ability_immune(mon, PokemonType.GROUND)
+            if not is_flying and not is_levitate:
+                spikes_dmg = {1: 0.125, 2: 0.167, 3: 0.25}
+                damage += spikes_dmg.get(spikes, 0.25)
+        return _clamp01(damage)
 
     def _damage_range_percent(
         self,
@@ -3018,4 +3133,5 @@ assert MY_TEAM_REVEALED_START + 6 == OPP_THREAT_START
 assert OPP_THREAT_START + OPP_THREAT_ROWS * OPP_THREAT_ROW_SIZE == OPP_THREAT_OHKO_START
 assert OPP_THREAT_OHKO_START + 6 == OPP_THREAT_CONFIDENCE_START
 assert OPP_THREAT_CONFIDENCE_START + 2 == ON_RECHARGE_INDEX
-assert ON_RECHARGE_INDEX + 1 == VECTOR_LENGTH
+assert ON_RECHARGE_INDEX + 1 == ALIVE_DIFF_INDEX
+assert ALIVE_DIFF_INDEX + 1 == VECTOR_LENGTH
