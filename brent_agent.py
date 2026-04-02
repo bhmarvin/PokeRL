@@ -85,7 +85,8 @@ OPP_THREAT_OHKO_START = OPP_THREAT_START + OPP_THREAT_ROWS * OPP_THREAT_ROW_SIZE
 OPP_THREAT_CONFIDENCE_START = OPP_THREAT_OHKO_START + 6
 ON_RECHARGE_INDEX = OPP_THREAT_CONFIDENCE_START + 2
 ALIVE_DIFF_INDEX = ON_RECHARGE_INDEX + 1
-VECTOR_LENGTH = ALIVE_DIFF_INDEX + 1
+FORCE_SWITCH_INDEX = ALIVE_DIFF_INDEX + 1
+VECTOR_LENGTH = FORCE_SWITCH_INDEX + 1
 
 TYPE_ORDER = (
     PokemonType.BUG,
@@ -367,6 +368,7 @@ class BrentObservationVectorBuilder:
             my_alive = sum(1 for m in battle.team.values() if not m.fainted)
             opp_alive = sum(1 for m in battle.opponent_team.values() if not m.fainted)
             vector[ALIVE_DIFF_INDEX] = (my_alive - opp_alive) / 6.0
+            vector[FORCE_SWITCH_INDEX] = 1.0 if getattr(battle, "force_switch", False) else 0.0
             return vector
         finally:
             self._damage_cache.clear()
@@ -3524,4 +3526,5 @@ assert OPP_THREAT_START + OPP_THREAT_ROWS * OPP_THREAT_ROW_SIZE == OPP_THREAT_OH
 assert OPP_THREAT_OHKO_START + 6 == OPP_THREAT_CONFIDENCE_START
 assert OPP_THREAT_CONFIDENCE_START + 2 == ON_RECHARGE_INDEX
 assert ON_RECHARGE_INDEX + 1 == ALIVE_DIFF_INDEX
-assert ALIVE_DIFF_INDEX + 1 == VECTOR_LENGTH
+assert ALIVE_DIFF_INDEX + 1 == FORCE_SWITCH_INDEX
+assert FORCE_SWITCH_INDEX + 1 == VECTOR_LENGTH
