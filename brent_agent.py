@@ -1686,7 +1686,7 @@ class BrentsRLAgent(SinglesEnv):
         self._consecutive_heal_count: Dict[str, int] = {}
         self._last_action_was_heal: Dict[str, bool] = {}
         # Track wasted free switches: mon species that entered via forced switch after faint
-        self._entered_after_faint: set[str] = set()
+        self._entered_after_faint: Dict[str, int] = {}
         self._last_active_species: Optional[str] = None
         self._last_active_fainted: bool = False
         # Head-Hunter: track opponent alive mons for faint detection
@@ -2087,7 +2087,7 @@ class BrentsRLAgent(SinglesEnv):
 
         # Detect free switch entry: if last active fainted and current active changed
         if self._last_active_fainted and active_species and active_species != self._last_active_species:
-            self._entered_after_faint.add(active_species)
+            self._entered_after_faint[active_species] = battle.turn
             self._last_active_fainted = False
 
         # Track consecutive heals per active mon
@@ -2192,13 +2192,18 @@ class BrentsRLAgent(SinglesEnv):
         if species is None:
             return None
 
-        if species not in self._entered_after_faint:
+        entry_turn = self._entered_after_faint.pop(species, None)
+        if entry_turn is None:
             return None
 
-        # This mon entered after a faint and is now switching out on turn 1
-        self._entered_after_faint.discard(species)
+        # Only penalize if switching out on the very next turn after free entry
+        if battle.turn > entry_turn + 1:
+            return None
+
         return {
             "species": species,
+            "entry_turn": entry_turn,
+            "switch_turn": battle.turn,
             "hp_fraction": round(_safe_hp_fraction(active), 3),
         }
 
@@ -2388,8 +2393,8 @@ class BrentsRLAgent(SinglesEnv):
         )
         best_alt_ev = best_alt["expected_value"] if best_alt is not None else 0.0
 
-        if chosen_ev >= 0.25 and best_alt_ev < chosen_ev * 0.85:
-            return None
+        if best_alt_ev < chosen_ev:
+            return None  # self-drop move is still the best damaging option
 
         return {
             "stat": relevant_stat,
