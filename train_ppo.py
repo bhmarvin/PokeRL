@@ -336,7 +336,17 @@ class PokeEnvEvalCallback(BaseCallback):
         eval_tactical_shaping_report: dict[str, Any] = {}
         try:
             for ep in range(self.n_eval_episodes):
-                obs, _ = env.reset()
+                for _retry in range(3):
+                    try:
+                        obs, _ = env.reset()
+                        break
+                    except OSError:
+                        time.sleep(0.5)
+                        env.close()
+                        env = create_wrapped_env(self.args, self.args.eval_opponent)
+                else:
+                    print(f"  [eval] skipping episode {ep} — could not reset env")
+                    continue
                 done, total_reward = False, 0.0
                 episode_steps = 0
                 while not done:
