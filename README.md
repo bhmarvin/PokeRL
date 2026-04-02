@@ -4,23 +4,23 @@ PokeRL is a reinforcement-learning project built on top of `poke_env` and Stable
 
 The project focuses on:
 
-- a 757-dim structured observation tensor with battle-state, move-value, bench matchup, targeting, and theory-of-mind features
-- a structured feature extractor that processes semantic blocks (active mons, moves, bench slots, threats) through shared-weight encoders before feeding a [256,128] MLP
+- a 758-dim structured observation tensor with battle-state, move-value, bench matchup, targeting, and theory-of-mind features
+- a structured feature extractor that processes semantic blocks (active mons, moves, bench slots, threats) through shared-weight encoders before feeding a [512,256,128] MLP
 - reward shaping on top of `poke_env`'s state-delta helper with tactical levers
 - masked PPO so the policy never assigns probability mass to illegal actions
 - repeatable training, checkpointing, evaluation, and summary output
 
 ## Main Files
 
-- `brent_agent.py`: observation vector (757 dims), reward shaping, damage estimation, type/ability mechanics, tactical lever evaluation
+- `brent_agent.py`: observation vector (758 dims), reward shaping, damage estimation, type/ability mechanics, tactical lever evaluation
 - `train_ppo.py`: training entry point, checkpoint loading, eval callback, summary writing
-- `policies.py`: structured observation extractor (9 semantic block encoders) and masked PPO policy
+- `policies.py`: structured observation extractor (9 semantic block encoders, 705-dim output) and masked PPO policy
 - `opponents.py`: opponent selection (`random`, `max_base_power`, `simple_heuristic`)
 - `randbats_data.py`: randbats role priors and stat inference
 - `test_runner.py`: observation vector, tera, damage calc, volatile effect, and reward lever tests
 - `inspect_battle_debug.py`: interactive battle and embedding inspector
 
-## Observation Vector (757 dims)
+## Observation Vector (758 dims)
 
 | Block | Size | Description |
 |-------|------|-------------|
@@ -32,7 +32,7 @@ The project focuses on:
 | My Bench (5x63) | 315 | HP, types, move flags, intimidate, offensive matchup vs opp active (best EV, OHKO, speed), defensive matchup (max incoming), hazard entry damage, status conditions |
 | Opp Bench (5x20) | 100 | Revealed flag, HP, types |
 | Targeting (4x5) | 20 | My moves damage EV vs each opp bench slot |
-| Threat/Meta | 48 | Team revealed, opp threat rows (4 moves x EV vs team), OHKO risk, role confidence, recharge, alive count diff |
+| Threat/Meta | 49 | Team revealed, opp threat rows (4 moves x EV vs team), OHKO risk, role confidence, recharge, alive count diff, force switch |
 
 ### Move Block Detail (37 features per move)
 
@@ -81,7 +81,7 @@ The manual damage calculator (`_manual_damage_calc`) implements the Gen 9 damage
 
 ## Structured Extractor
 
-The `StructuredObservationExtractor` in `policies.py` slices the pre-normalized observation vector into 9 semantic blocks. Each block passes through a small Linear+ReLU encoder. Repeated structures (moves, bench slots) use **shared-weight encoders** -- the same network processes each slot. Output is 561 dims fed to a [256,128] actor-critic MLP. Block sizes auto-derive from `brent_agent.py` constants.
+The `StructuredObservationExtractor` in `policies.py` slices the pre-normalized observation vector into 9 semantic blocks. Each block passes through a small Linear+ReLU encoder. Repeated structures (moves, bench slots) use **shared-weight encoders** -- the same network processes each slot. Output is 705 dims fed to a [512,256,128] actor-critic MLP. Block sizes auto-derive from `brent_agent.py` constants.
 
 ## Reward Shaping
 
@@ -104,17 +104,17 @@ Tactical levers (penalties/bonuses applied per-decision):
 
 ## Training
 
-Recommended training pipeline (progressive difficulty):
+Recommended training pipeline (progressive difficulty, multi-env):
 
 ```powershell
-# Stage 1: Random opponent (100k steps)
-.\venv\Scripts\python.exe train_ppo.py --train-timesteps 100000 --train-opponent random --eval-opponent random --eval-freq 10000 --eval-battles 100 --device cuda --run-name stage1_random
+# Stage 1: Random opponent (100k steps, 4 envs)
+.\venv\Scripts\python.exe train_ppo.py --train-timesteps 100000 --train-opponents "random,random,random,random" --n-envs 4 --eval-opponent random --eval-freq 10000 --eval-battles 100 --device cuda --run-name stage1_random
 
 # Stage 2: Max base power (200k steps, resume from stage 1)
-.\venv\Scripts\python.exe train_ppo.py --train-timesteps 200000 --train-opponent max_base_power --eval-opponent max_base_power --eval-freq 10000 --eval-battles 100 --device cuda --run-name stage2_maxpower --resume-from results\ppo\stage1_random\model.zip
+.\venv\Scripts\python.exe train_ppo.py --train-timesteps 200000 --train-opponents "max_base_power,max_base_power,max_base_power,max_base_power" --n-envs 4 --eval-opponent max_base_power --eval-freq 10000 --eval-battles 100 --device cuda --learning-rate 1e-4 --run-name stage2_maxpower --resume-from results\ppo\stage1_random\best_model\best_model.zip
 
-# Stage 3: Simple heuristic (300k steps, resume from stage 2)
-.\venv\Scripts\python.exe train_ppo.py --train-timesteps 300000 --train-opponent simple_heuristic --eval-opponent simple_heuristic --eval-freq 10000 --eval-battles 100 --device cuda --run-name stage3_heuristic --resume-from results\ppo\stage2_maxpower\model.zip
+# Stage 3: Simple heuristic (300k steps, 8 envs, mixed opponents)
+.\venv\Scripts\python.exe train_ppo.py --train-timesteps 300000 --train-opponents "simple_heuristic,simple_heuristic,simple_heuristic,simple_heuristic,simple_heuristic,simple_heuristic,simple_heuristic,max_base_power" --n-envs 8 --eval-opponent simple_heuristic --eval-freq 10000 --eval-battles 100 --device cuda --learning-rate 1e-4 --run-name stage3_heuristic --resume-from results\ppo\stage2_maxpower\best_model\best_model.zip
 ```
 
 ## Outputs
