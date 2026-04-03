@@ -99,6 +99,68 @@ class BrentsRLAgent(SinglesEnv):
             for agent in self.possible_agents
         }
 
+    @staticmethod
+    def get_action_mask(battle) -> list[int]:
+        """Override poke_env's get_action_mask to fix the 5-move collision bug.
+
+        The upstream implementation iterates over active_pokemon.moves (all known
+        moves, can exceed 4) instead of battle.available_moves (capped at 4).
+        When a mon knows 5+ moves, move indices spill into the mega zone (10-13),
+        causing illegal actions.
+
+        Fix: iterate available_moves directly, indexed 0-3.
+        """
+        from poke_env.environment.singles_env import SPECIAL_MOVES
+
+        switch_space = [
+            i
+            for i, pokemon in enumerate(battle.team.values())
+            if not battle.trapped
+            and pokemon.base_species
+            in [p.base_species for p in battle.available_switches]
+        ]
+
+        if battle._wait:
+            actions = [0]
+        elif battle.active_pokemon is None:
+            actions = switch_space
+        else:
+            # FIX: use available_moves directly (max 4), not active_pokemon.moves
+            move_space = [6 + i for i in range(len(battle.available_moves[:4]))]
+
+            mega_space = [i + 4 for i in move_space if battle.can_mega_evolve]
+            # Z-moves: match available z-moves against available_moves
+            zmove_space = []
+            if battle.can_z_move and hasattr(battle.active_pokemon, "available_z_moves"):
+                avail_z_ids = {m.id for m in battle.active_pokemon.available_z_moves}
+                for i, move in enumerate(battle.available_moves[:4]):
+                    if move.id in avail_z_ids:
+                        zmove_space.append(6 + i + 8)
+            dynamax_space = [i + 12 for i in move_space if battle.can_dynamax]
+            tera_space = [i + 16 for i in move_space if battle.can_tera]
+
+            if (
+                not move_space
+                and len(battle.available_moves) == 1
+                and battle.available_moves[0].id in SPECIAL_MOVES
+            ):
+                move_space = [6]
+
+            actions = (
+                switch_space
+                + move_space
+                + mega_space
+                + zmove_space
+                + dynamax_space
+                + tera_space
+            )
+
+        action_mask = [
+            int(i in actions)
+            for i in range(SinglesEnv.get_action_space_size(battle.gen))
+        ]
+        return action_mask
+
     def calc_reward(self, battle: AbstractBattle) -> float:
         base_config = {key: REWARD_CONFIG[key] for key in POKE_ENV_REWARD_KEYS}
         reward = self.reward_computing_helper(battle, **base_config)

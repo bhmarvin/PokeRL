@@ -1381,49 +1381,31 @@ def main() -> None:
         available_switches=[lugia],
     )
 
-    mask = SinglesEnv.get_action_mask(mask_battle)
+    # Verify upstream poke_env bug still exists
+    upstream_mask = SinglesEnv.get_action_mask(mask_battle)
     action_space_size = SinglesEnv.get_action_space_size(9)  # 26
-    assert len(mask) == action_space_size, f"mask length {len(mask)} != {action_space_size}"
-
-    # The 4 available moves should map to actions 7, 8, 9, 10 in the
-    # current (buggy) poke_env code because enumerate() doesn't cap at 4.
-    # Actions 6-9 are "move 0-3 plain".  Actions 10-13 are "move 0-3 mega".
-    #
-    # If i=4 (roar, 5th entry) -> action 10 is in move_space, but
-    # action_to_order interprets 10 as "move index 0 + mega" = transform mega.
-    #
-    # EXPECTED (correct): only actions 7,8,9 should be legal plain moves
-    #   (indices 1-3 in the 4-move window), and action 6 (transform) should
-    #   be masked out because transform is not in available_moves.
-    #   Roar should NOT produce action 10 — it overflows the 4-move window.
-    #
-    # ACTUAL (bug): action 10 is set to 1, colliding with mega move 0.
-
-    # Detect the bug:
-    move_actions_set = [i for i in range(6, 10) if mask[i] == 1]   # plain moves: 6-9
-    mega_zone_set = [i for i in range(10, 14) if mask[i] == 1]     # mega moves: 10-13
-
-    # In the buggy mask, roar (index 4) overflows to action 10, landing in
-    # the mega zone even though can_mega_evolve is False.
-    bug_detected = any(mask[i] == 1 for i in range(10, 14))
-    if bug_detected:
-        print(f"  BUG CONFIRMED: mask has legal actions in mega zone {mega_zone_set}")
-        print(f"    plain move actions: {move_actions_set}")
-        print(f"    This will crash when action_to_order interprets action 10")
-        print(f"    as 'move 0 + mega' instead of 'move 4 plain'.")
-        print("  Action mask 5-move collision: BUG DETECTED (expected)")
+    assert len(upstream_mask) == action_space_size, f"mask length {len(upstream_mask)} != {action_space_size}"
+    upstream_bug = any(upstream_mask[i] == 1 for i in range(10, 14))
+    if upstream_bug:
+        print("  Upstream poke_env bug still present (5-move overflow into mega zone)")
     else:
-        print("  No collision detected — bug may be fixed upstream.")
-        print(f"    plain move actions: {move_actions_set}")
+        print("  Upstream bug appears fixed — our override may no longer be needed")
 
-    # Also verify: action 6 (transform, index 0) should NOT be legal
-    if mask[6] == 1:
-        print("  WARNING: transform (action 6) is marked legal but not in available_moves!")
+    # Verify OUR override fixes it
+    fixed_mask = BrentsRLAgent.get_action_mask(mask_battle)
+    assert len(fixed_mask) == action_space_size
+    move_actions = [i for i in range(6, 10) if fixed_mask[i] == 1]
+    mega_zone = [i for i in range(10, 14) if fixed_mask[i] == 1]
+    assert not mega_zone, f"Override still has mega zone collision: {mega_zone}"
+    # Should have exactly 4 legal moves (actions 6-9)
+    assert move_actions == [6, 7, 8, 9], f"Expected moves [6,7,8,9], got {move_actions}"
+    print(f"  Override fix verified: move actions={move_actions}, mega zone={mega_zone}")
+    print("  Action mask 5-move collision: FIXED")
 
     # Count total legal actions for sanity
-    legal_count = sum(mask)
-    print(f"  Total legal actions in mask: {legal_count}")
-    print(f"  Full mask: {mask}")
+    legal_count = sum(fixed_mask)
+    print(f"  Total legal actions in fixed mask: {legal_count}")
+    print(f"  Fixed mask: {fixed_mask}")
 
     print("\n== ALL TESTS PASSED ==")
 
