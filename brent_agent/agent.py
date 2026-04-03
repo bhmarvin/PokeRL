@@ -89,6 +89,9 @@ class BrentsRLAgent(SinglesEnv):
         self._last_active_fainted: bool = False
         # Head-Hunter: track opponent alive mons for faint detection
         self._prev_opp_alive: set[str] = set()
+        # Retrospective switch tracking: did we just switch?
+        self._just_switched: bool = False
+        self._switched_from_types: Optional[Tuple] = None
         self.observation_spaces = {
             agent: Box(
                 low=-1.0,
@@ -173,7 +176,56 @@ class BrentsRLAgent(SinglesEnv):
         reward = self.reward_computing_helper(battle, **base_config)
         shaping = self._consume_tactical_shaping(battle)
         head_hunter = self._head_hunter_bonus(battle)
-        return reward + shaping + head_hunter
+        predicted_switch = self._predicted_switch_bonus(battle)
+        return reward + shaping + head_hunter + predicted_switch
+
+    def _predicted_switch_bonus(self, battle: AbstractBattle) -> float:
+        """Retrospective reward: we switched last turn, opponent used a move,
+        and our switch-in resisted or was immune to it."""
+        if not self._just_switched:
+            return 0.0
+        self._just_switched = False  # consume once
+
+        active = battle.active_pokemon
+        opponent = battle.opponent_active_pokemon
+        if active is None or opponent is None:
+            return 0.0
+
+        opp_last_move = getattr(opponent, "last_move", None)
+        if opp_last_move is None or opp_last_move.base_power == 0:
+            return 0.0
+
+        # Check type effectiveness of opponent's move against our switch-in
+        move_type = opp_last_move.type
+        if move_type is None:
+            return 0.0
+
+        type_chart = self.vector_builder._gen_data.type_chart
+        mult = _defender_type_mult(move_type, active, type_chart)
+
+        bonus_value = float(REWARD_CONFIG.get("bonus_predicted_switch", 0.0))
+        if mult == 0.0:
+            # Full immunity — great prediction
+            reward = bonus_value * 1.5
+        elif mult <= 0.5:
+            # Resisted — good prediction
+            reward = bonus_value
+        else:
+            return 0.0
+
+        # Track for shaping reports
+        self._tactical_shaping_counts["predicted_switch"] = (
+            self._tactical_shaping_counts.get("predicted_switch", 0) + 1
+        )
+        self._tactical_shaping_totals["predicted_switch"] = (
+            self._tactical_shaping_totals.get("predicted_switch", 0.0) + reward
+        )
+        self._tactical_shaping_total += reward
+        self._tactical_positive_total += reward
+        self._tactical_shaping_shaped_actions += 1
+        self._tactical_shaping_rewarded_actions += 1
+
+        return reward
 
     def _head_hunter_bonus(self, battle: AbstractBattle) -> float:
         """Extra reward for KOing high-threat opponent mons.
@@ -229,6 +281,10 @@ class BrentsRLAgent(SinglesEnv):
         fake: bool = False,
         strict: bool = True,
     ) -> BattleOrder:
+        # Capture current active types BEFORE the switch for retrospective eval
+        active = battle.active_pokemon
+        if active is not None:
+            self._switched_from_types = _effective_types(active)
         order = super().action_to_order(action, battle, fake=fake, strict=strict)
         self._record_action_choice(order)
         self._remember_tactical_reward_context(battle, order)
@@ -240,6 +296,10 @@ class BrentsRLAgent(SinglesEnv):
             self._decision_count += 1
         if isinstance(action, Pokemon):
             self._switch_action_count += 1
+            self._just_switched = True
+        else:
+            self._just_switched = False
+            self._switched_from_types = None
 
     def _remember_tactical_reward_context(
         self,
@@ -442,6 +502,12 @@ class BrentsRLAgent(SinglesEnv):
                 "good_setup",
                 "bonus_good_setup",
                 self._evaluate_good_setup(battle, move),
+                False,
+            ),
+            (
+                "redundant_taunt",
+                "penalty_redundant_taunt",
+                self._evaluate_redundant_taunt(battle, move),
                 False,
             ),
         ):
@@ -730,6 +796,21 @@ class BrentsRLAgent(SinglesEnv):
             "effective_heal": round(effective_heal, 3),
             "overflow": round(max(0.0, raw_heal - effective_heal), 3),
         }
+
+    def _evaluate_redundant_taunt(
+        self,
+        battle: AbstractBattle,
+        move: Move,
+    ) -> Optional[Dict[str, Any]]:
+        """Penalize using Taunt when opponent is already taunted."""
+        if move.id != "taunt":
+            return None
+        opponent = battle.opponent_active_pokemon
+        if opponent is None:
+            return None
+        if Effect.TAUNT not in opponent.effects:
+            return None
+        return {"opponent_already_taunted": True}
 
     def _evaluate_redundant_stealthrock(
         self,

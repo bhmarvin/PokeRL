@@ -437,6 +437,8 @@ def build_test_agent() -> BrentsRLAgent:
     agent._last_active_species = None
     agent._last_active_fainted = False
     agent._prev_opp_alive = set()
+    agent._just_switched = False
+    agent._switched_from_types = None
     agent.reward_computing_helper = lambda battle, **kwargs: 0.0
     return agent
 
