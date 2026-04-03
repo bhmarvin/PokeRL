@@ -57,7 +57,7 @@ class SelfPlayPlayer(Player):
                 "observation": np.expand_dims(obs, axis=0),
                 "action_mask": np.expand_dims(mask, axis=0),
             }
-            action, _ = self.model.predict(batched_obs, deterministic=True)
+            action, _ = self.model.predict(batched_obs, deterministic=False)
             action_idx = np.int64(np.asarray(action).reshape(-1)[0])
 
             order = SinglesEnv.action_to_order(action_idx, battle, fake=False, strict=False)

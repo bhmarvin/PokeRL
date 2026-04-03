@@ -285,7 +285,7 @@ class BrentsRLAgent(SinglesEnv):
         active = battle.active_pokemon
         if active is not None:
             self._switched_from_types = _effective_types(active)
-        order = super().action_to_order(action, battle, fake=fake, strict=strict)
+        order = super().action_to_order(action, battle, fake=fake, strict=False)
         self._record_action_choice(order)
         self._remember_tactical_reward_context(battle, order)
         return order
