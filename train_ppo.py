@@ -25,6 +25,7 @@ from brent_agent import BrentsRLAgent, REWARD_CONFIG, VECTOR_LENGTH
 from experiment_io import make_run_name, prepare_run_artifacts, write_summary
 from opponents import OPPONENT_CHOICES, create_opponent
 from policies import MaskedActorCriticPolicy
+from self_play import CheckpointPool
 
 
 def format_penalty_report(report: dict[str, Any]) -> str:
@@ -132,6 +133,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name")
     parser.add_argument("--checkpoint-path")
     parser.add_argument("--resume-from")
+    parser.add_argument("--self-play-checkpoint",
+                        help="Path to PPO checkpoint used as self-play opponent (required when any opponent is 'self_play')")
     parser.add_argument("--save-freq", type=int, default=50000, help="Save checkpoint every X steps")
     parser.add_argument("--eval-freq", type=int, default=10000, help="Evaluate every X steps")
     parser.add_argument("--learning-rate", type=float, default=3e-4,
@@ -151,11 +154,13 @@ def create_wrapped_env(args: argparse.Namespace, opponent_name: str) -> Monitor:
         battle_format=args.battle_format,
         log_level=args.log_level,
         start_listening=False,
+        checkpoint_path=getattr(args, "self_play_checkpoint", None),
     )
     return Monitor(SingleAgentWrapper(env, opponent))
 
 
-def _make_env_fn(opponent_name: str, battle_format: str, log_level: int):
+def _make_env_fn(opponent_name: str, battle_format: str, log_level: int,
+                  checkpoint_path: str | None = None):
     """Lazy factory — all poke_env objects are created inside the subprocess."""
     def _init():
         env = BrentsRLAgent(
@@ -169,6 +174,7 @@ def _make_env_fn(opponent_name: str, battle_format: str, log_level: int):
             battle_format=battle_format,
             log_level=log_level,
             start_listening=False,
+            checkpoint_path=checkpoint_path,
         )
         return Monitor(SingleAgentWrapper(env, opponent))
     return _init
@@ -194,7 +200,8 @@ def create_vec_env(args: argparse.Namespace) -> SubprocVecEnv:
             f"--train-opponents has {len(opponents)} entries but --n-envs is {args.n_envs}; they must match"
         )
     return SubprocVecEnv([
-        _make_env_fn(opp, args.battle_format, args.log_level)
+        _make_env_fn(opp, args.battle_format, args.log_level,
+                      checkpoint_path=getattr(args, "self_play_checkpoint", None))
         for opp in opponents
     ])
 
@@ -298,6 +305,7 @@ class PokeEnvEvalCallback(BaseCallback):
         best_model_save_path: str,
         log_path: str,
         tracked_env: BrentsRLAgent | None = None,
+        checkpoint_pool: CheckpointPool | None = None,
         verbose: int = 1,
     ):
         super().__init__(verbose)
@@ -307,6 +315,7 @@ class PokeEnvEvalCallback(BaseCallback):
         self.best_model_save_path = best_model_save_path
         self.log_path = log_path
         self.tracked_env = tracked_env
+        self.checkpoint_pool = checkpoint_pool
         self.best_mean_reward = -np.inf
 
     def _on_step(self) -> bool:
@@ -393,9 +402,14 @@ class PokeEnvEvalCallback(BaseCallback):
         if mean_reward > self.best_mean_reward:
             self.best_mean_reward = mean_reward
             os.makedirs(self.best_model_save_path, exist_ok=True)
-            self.model.save(os.path.join(self.best_model_save_path, "best_model"))
+            best_path = os.path.join(self.best_model_save_path, "best_model")
+            self.model.save(best_path)
             if self.verbose:
                 print(f"  New best model saved (reward={mean_reward:.3f})")
+            if self.checkpoint_pool is not None:
+                self.checkpoint_pool.add(best_path)
+                if self.verbose:
+                    print(f"  Checkpoint pool updated (size={len(self.checkpoint_pool)})")
 
         return True
 
@@ -430,8 +444,23 @@ def build_model(args: argparse.Namespace, env: Monitor) -> PPO:
     )
 
 
+def _validate_self_play_args(args: argparse.Namespace) -> None:
+    """Raise early if self_play opponent is requested without a checkpoint."""
+    all_opponents = []
+    if args.train_opponents:
+        all_opponents.extend(o.strip() for o in args.train_opponents.split(","))
+    else:
+        all_opponents.append(args.train_opponent)
+    all_opponents.append(args.eval_opponent)
+    if "self_play" in all_opponents and not args.self_play_checkpoint:
+        raise ValueError(
+            "--self-play-checkpoint is required when any opponent is 'self_play'"
+        )
+
+
 def main() -> None:
     args = parse_args()
+    _validate_self_play_args(args)
     start = time.perf_counter()
     run_name = args.run_name or make_run_name("ppo", args.seed)
     artifacts = prepare_run_artifacts(
@@ -468,6 +497,19 @@ def main() -> None:
                 name_prefix="rl_model",
             )
 
+            # Set up checkpoint pool for self-play tracking
+            sp_pool: CheckpointPool | None = None
+            if args.self_play_checkpoint:
+                sp_pool = CheckpointPool()
+                sp_pool.add(args.self_play_checkpoint)
+                # Seed the self-play checkpoint path so weight refresh works
+                # from the start (opponent reloads from this path as training saves new bests)
+                if not os.path.exists(args.self_play_checkpoint) and args.resume_from:
+                    os.makedirs(os.path.dirname(args.self_play_checkpoint), exist_ok=True)
+                    import shutil
+                    shutil.copy2(args.resume_from, args.self_play_checkpoint)
+                    print(f"Seeded self-play checkpoint: {args.self_play_checkpoint}")
+
             eval_callback = PokeEnvEvalCallback(
                 args=args,
                 eval_freq=args.eval_freq,
@@ -475,6 +517,7 @@ def main() -> None:
                 best_model_save_path=os.path.join(artifacts["run_dir"], "best_model"),
                 log_path=artifacts["run_dir"],
                 tracked_env=train_env,
+                checkpoint_pool=sp_pool,
             )
 
             model.learn(
