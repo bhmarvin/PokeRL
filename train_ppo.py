@@ -406,18 +406,21 @@ def build_model(args: argparse.Namespace, env: Monitor) -> PPO:
         model = PPO.load(
             args.resume_from, env=env, device=args.device,
             tensorboard_log=os.path.join(args.output_dir, "logs"),
-            custom_objects={"learning_rate": args.learning_rate, "ent_coef": 0.02},
+            custom_objects={"learning_rate": args.learning_rate, "ent_coef": 0.02, "n_steps": 4096, "batch_size": 256},
         )
         print(f"  learning_rate overridden to {args.learning_rate}")
         print(f"  ent_coef overridden to 0.02")
         return model
 
+    base_lr = args.learning_rate
+    lr_schedule = lambda progress: base_lr * (1.0 - 0.9 * progress)
+
     return PPO(
         MaskedActorCriticPolicy,
         env,
-        learning_rate=args.learning_rate,
-        n_steps=2048,
-        batch_size=128,
+        learning_rate=lr_schedule,
+        n_steps=4096,
+        batch_size=256,
         gamma=0.99,
         ent_coef=0.02,
         device=args.device,

@@ -66,13 +66,13 @@ class StructuredObservationExtractor(BaseFeaturesExtractor):
     _MY_BENCH_OUT = 48  # per slot, ×5 = 240
     _OPP_BENCH_OUT = 16  # per slot, ×5 = 80
     _TARGETING_OUT = 16
-    _THREAT_OUT = 32
+    _THREAT_OUT = 64
 
     FEATURES_DIM = (
         _GLOBAL_OUT + _MY_ACTIVE_OUT + _OPP_ACTIVE_OUT + _SPEED_OUT
         + _MOVE_OUT * 4 + _MY_BENCH_OUT * 5 + _OPP_BENCH_OUT * 5
         + _TARGETING_OUT + _THREAT_OUT
-    )  # = 705
+    )  # = 737
 
     def __init__(self, observation_space: Any):
         super().__init__(observation_space, features_dim=self.FEATURES_DIM)
@@ -135,7 +135,7 @@ class MaskedActorCriticPolicy(ActorCriticPolicy):
         super().__init__(
             *args,
             **kwargs,
-            net_arch=[512, 256, 128],
+            net_arch=dict(pi=[256, 128], vf=[256, 128]),
             features_extractor_class=StructuredObservationExtractor,
         )
         self._mask: th.Tensor | None = None
