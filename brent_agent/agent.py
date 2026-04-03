@@ -369,6 +369,12 @@ class BrentsRLAgent(SinglesEnv):
                 self._evaluate_good_attack_selection(battle, move),
                 False,
             ),
+            (
+                "good_setup",
+                "bonus_good_setup",
+                self._evaluate_good_setup(battle, move),
+                False,
+            ),
         ):
             match = self._make_tactical_match(
                 reason,
@@ -404,6 +410,12 @@ class BrentsRLAgent(SinglesEnv):
                 "penalty_wasted_free_switch",
                 self._evaluate_wasted_free_switch(battle),
                 True,
+            ),
+            (
+                "pivot_into_advantage",
+                "bonus_pivot_into_advantage",
+                self._evaluate_pivot_into_advantage(battle, switch_target),
+                False,
             ),
         ):
             match = self._make_tactical_match(reason, reward_key, details, record_audit=record_audit)
@@ -845,6 +857,107 @@ class BrentsRLAgent(SinglesEnv):
             "best_expected_value": round(best_ev, 3),
             "best_max_pct": round(float(best_move["max_pct"]), 3),
             "secured_ko": bool(ko_pressure),
+        }
+
+    def _evaluate_good_setup(
+        self,
+        battle: AbstractBattle,
+        move: Move,
+    ) -> Optional[Dict[str, Any]]:
+        """Reward using a stat-boosting setup move when safe to do so:
+        HP > 60%, not outsped for KO, and in a favorable or neutral matchup."""
+        if self.vector_builder._move_is_setup(move) < 1.0:
+            return None
+
+        active = battle.active_pokemon
+        opponent = battle.opponent_active_pokemon
+        if active is None or opponent is None:
+            return None
+
+        hp = _safe_hp_fraction(active)
+        if hp <= 0.6:
+            return None
+
+        # Check we're not about to be KO'd
+        threat = self._assess_battle_threats(battle)
+        if threat.active_max_threat >= 0.8 or threat.active_ohko_risk >= 0.3:
+            return None
+
+        # Check speed: either we outspeed or we're bulky enough to take a hit
+        outspeeds = (
+            threat.active_speed is not None
+            and threat.opponent_speed is not None
+            and threat.active_speed > threat.opponent_speed
+        )
+        bulky_enough = hp > 0.8 and threat.active_max_threat < 0.5
+
+        if not outspeeds and not bulky_enough:
+            return None
+
+        return {
+            "move": move.id,
+            "hp_fraction": round(hp, 3),
+            "max_threat": round(threat.active_max_threat, 3),
+            "outspeeds": outspeeds,
+        }
+
+    def _evaluate_pivot_into_advantage(
+        self,
+        battle: AbstractBattle,
+        switch_target: Pokemon,
+    ) -> Optional[Dict[str, Any]]:
+        """Reward switching via a pivot move (U-turn/Volt Switch/Flip Turn)
+        into a mon that resists the opponent's STAB and has a credible reply.
+        Only fires when the PREVIOUS move was a pivot move."""
+        active = battle.active_pokemon
+        opponent = battle.opponent_active_pokemon
+        if active is None or opponent is None:
+            return None
+
+        # Check if active just used a pivot move
+        last_move = active.last_move if hasattr(active, "last_move") else None
+        if last_move is None:
+            return None
+        is_pivot = last_move.id in ("uturn", "voltswitch", "flipturn", "teleport")
+        if not is_pivot:
+            # Also check self_switch flag
+            try:
+                is_pivot = bool(last_move.self_switch)
+            except Exception:
+                pass
+        if not is_pivot:
+            return None
+
+        # Check switch target resists opponent's STAB types
+        opp_types = _effective_types(opponent)
+        type_chart = self.vector_builder._gen_data.type_chart
+        resists_stab = all(
+            _defender_type_mult(opp_type, switch_target, type_chart) <= 0.5
+            for opp_type in opp_types
+            if opp_type is not None
+        )
+        if not resists_stab:
+            return None
+
+        # Check switch target isn't immediately threatened
+        threat = self._assess_battle_threats(battle)
+        # Estimate threat to switch target
+        max_incoming = 0.0
+        for entry in threat.threat_entries:
+            ev = self.vector_builder._move_expected_value(
+                battle, opponent, switch_target, entry.move,
+                battle.opponent_role, battle.player_role,
+            )
+            if ev > max_incoming:
+                max_incoming = ev
+        if max_incoming > 0.45:
+            return None
+
+        return {
+            "pivot_move": last_move.id,
+            "switch_target": getattr(switch_target, "species", "?"),
+            "resists_stab": True,
+            "max_incoming": round(max_incoming, 3),
         }
 
     def _evaluate_unsafe_stay_in_with_fast_ko_switch(

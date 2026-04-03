@@ -578,8 +578,8 @@ def main() -> None:
     attack_agent._record_action_choice(attack_order)
     attack_agent._remember_tactical_reward_context(attack_battle, attack_order)
     attack_reward = attack_agent.calc_reward(attack_battle)
-    # good_attack_selection is zeroed out, hyperbeam KOs so unsafe_stay doesn't fire
-    assert np.isclose(attack_reward, 0.0), f"expected 0 reward, got {attack_reward}"
+    # good_attack_selection is enabled, hyperbeam KOs so unsafe_stay doesn't fire
+    assert np.isclose(attack_reward, REWARD_CONFIG["bonus_good_attack_selection"]), f"expected {REWARD_CONFIG['bonus_good_attack_selection']} reward, got {attack_reward}"
 
     low_quality_attack_battle = build_fake_battle()
     low_quality_attack_agent = build_test_agent()
