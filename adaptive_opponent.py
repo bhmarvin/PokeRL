@@ -58,6 +58,7 @@ class AdaptivePlayer(Player):
         self._recent_results: deque[bool] = deque(maxlen=window)
         self._current_idx = 0
         self._prev_battle_tag: str | None = None
+        self._prev_battle: AbstractBattle | None = None
 
         # Build the opponent ladder (easy -> hard)
         self._opponents: list[Player] = self._build_ladder(
@@ -124,17 +125,21 @@ class AdaptivePlayer(Player):
         tag = battle.battle_tag
         if self._prev_battle_tag is None:
             self._prev_battle_tag = tag
+            self._prev_battle = battle
             return
 
         if tag != self._prev_battle_tag:
-            # A new battle started — look up the old battle to get its result.
-            old_battle = self._battles.get(self._prev_battle_tag)
-            if old_battle is not None and old_battle.finished:
-                # old_battle.won is from the *opponent's* perspective (this player).
-                # Agent won = opponent lost, so agent_won = not old_battle.won.
-                agent_won = old_battle.won is False
+            # A new battle started — check the previous battle's result.
+            if self._prev_battle is not None and self._prev_battle.finished:
+                # prev_battle is from the opponent's perspective (this player).
+                # Agent won = opponent lost.
+                agent_won = self._prev_battle.won is False
                 self._record_result(agent_won)
             self._prev_battle_tag = tag
+            self._prev_battle = battle
+        else:
+            # Same battle, update reference
+            self._prev_battle = battle
 
     def _record_result(self, agent_won: bool) -> None:
         """Record a game outcome and check for tier promotion/demotion."""
