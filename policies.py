@@ -36,14 +36,14 @@ _MOVES_END = MY_BENCH_START                            # 126:274
 _MY_BENCH_END = OPP_BENCH_START                        # 274:589
 _OPP_BENCH_END = TARGETING_START                       # 589:689
 _TARGETING_END = MY_TEAM_REVEALED_START                # 689:709
-_THREAT_END = FORCE_SWITCH_INDEX + 1                    # 709:758
+_THREAT_END = VECTOR_LENGTH                              # 709:780 (includes extended tail)
 
 # Block sizes
 _GLOBAL_SIZE = _GLOBAL_END                             # 24
 _MY_ACTIVE_SIZE = MY_ACTIVE_BLOCK_SIZE                 # 60
 _OPP_ACTIVE_SIZE = OPP_ACTIVE_BLOCK_SIZE               # 41
 _TARGETING_SIZE = _TARGETING_END - TARGETING_START      # 20
-_THREAT_SIZE = _THREAT_END - _TARGETING_END             # 48 (was 47, +1 alive_diff)
+_THREAT_SIZE = _THREAT_END - _TARGETING_END             # 71 (threat + extended tail)
 
 
 class StructuredObservationExtractor(BaseFeaturesExtractor):

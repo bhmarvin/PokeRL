@@ -62,6 +62,12 @@ from .constants import (
     VOLATILE_ORDER,
     WEATHER_HEAL_MOVES,
     WEATHER_ORDER,
+    OPP_ABILITY_ORDER,
+    OPP_ABILITY_SIZE,
+    OPP_ABILITY_START,
+    OPP_TAILWIND_INDEX,
+    MY_TAILWIND_INDEX,
+    SPEED_RATIO_INDEX,
     OpponentThreatEntry,
     _ability_immune,
     _battle_tag,
@@ -117,6 +123,8 @@ class BrentObservationVectorBuilder:
             opp_alive = sum(1 for m in battle.opponent_team.values() if not m.fainted)
             vector[ALIVE_DIFF_INDEX] = (my_alive - opp_alive) / 6.0
             vector[FORCE_SWITCH_INDEX] = 1.0 if getattr(battle, "force_switch", False) else 0.0
+            # Extended tail: speed ratio, tailwind, opponent ability
+            self._fill_extended_tail(vector, battle)
             return vector
         finally:
             self._damage_cache.clear()
@@ -200,7 +208,7 @@ class BrentObservationVectorBuilder:
                 memory.add(_mon_key(mon))
 
     def _fill_global_features(self, vector: np.ndarray, battle: AbstractBattle) -> None:
-        vector[TURN_INDEX] = float(getattr(battle, "turn", 0)) / 100.0
+        vector[TURN_INDEX] = _clamp01(float(getattr(battle, "turn", 0)) / 100.0)
         for idx, weather in enumerate(WEATHER_ORDER, start=WEATHER_START):
             vector[idx] = 1.0 if weather in battle.weather else 0.0
         for idx, terrain in enumerate(TERRAIN_ORDER, start=TERRAIN_START):
@@ -512,7 +520,7 @@ class BrentObservationVectorBuilder:
         vector[start + 7] = 1.0 if category == MoveCategory.SPECIAL else 0.0
         vector[start + 8] = 1.0 if "contact" in flags else 0.0
         vector[start + 9] = 1.0 if "sound" in flags else 0.0
-        vector[start + 10] = 1.0 if priority > 0 else 0.0
+        vector[start + 10] = _clamp(priority / 3.0, -1.0, 1.0)
         vector[start + 11] = 1.0 if self._is_pivot(move) else 0.0
         vector[start + 12] = _clamp01(self._effective_move_heal_amount(move, attacker, battle))
         vector[start + 13] = _clamp01(self._move_drain(move))
@@ -548,6 +556,10 @@ class BrentObservationVectorBuilder:
         vector[start + 35] = self._move_target_stat_drop_chance(move, "accuracy", attacker=attacker)
         # Multi-hit flag
         vector[start + 36] = 1.0 if getattr(move, "n_hit", (1, 1)) != (1, 1) else 0.0
+        # PP fraction (current / max), defaults to 1.0 if unknown
+        max_pp = getattr(move, "max_pp", 0) or 0
+        current_pp = getattr(move, "current_pp", max_pp) if max_pp > 0 else 0
+        vector[start + 37] = _clamp01(float(current_pp) / float(max_pp)) if max_pp > 0 else 1.0
 
     def _fill_my_bench(self, vector: np.ndarray, battle: AbstractBattle) -> None:
         bench = [mon for mon in battle.team.values() if not mon.active][:5]
@@ -743,6 +755,40 @@ class BrentObservationVectorBuilder:
         top_role_mass, role_entropy_norm = self._role_posterior_summary(posterior)
         vector[OPP_THREAT_CONFIDENCE_START] = top_role_mass
         vector[OPP_THREAT_CONFIDENCE_START + 1] = role_entropy_norm
+
+    def _fill_extended_tail(self, vector: np.ndarray, battle: AbstractBattle) -> None:
+        """Fill extended tail features: speed ratio, tailwind, opponent ability."""
+        # Speed ratio: continuous value instead of just binary advantage
+        my_speed = self._effective_speed(battle.active_pokemon, battle.side_conditions)
+        opp_posterior = (
+            self._opponent_role_posterior(battle.opponent_active_pokemon)
+            if battle.opponent_active_pokemon is not None else None
+        )
+        opp_speed = self._effective_speed(
+            battle.opponent_active_pokemon,
+            battle.opponent_side_conditions,
+            role_posterior=opp_posterior,
+        )
+        if my_speed is not None and opp_speed is not None and opp_speed > 0:
+            # Ratio clamped to [0, 1]: 0.5 = equal speed, >0.5 = faster, <0.5 = slower
+            vector[SPEED_RATIO_INDEX] = _clamp01(my_speed / (my_speed + opp_speed))
+        else:
+            vector[SPEED_RATIO_INDEX] = 0.5  # unknown
+
+        # Tailwind flags
+        vector[MY_TAILWIND_INDEX] = 1.0 if SideCondition.TAILWIND in battle.side_conditions else 0.0
+        vector[OPP_TAILWIND_INDEX] = 1.0 if SideCondition.TAILWIND in battle.opponent_side_conditions else 0.0
+
+        # Opponent ability one-hot
+        opponent = battle.opponent_active_pokemon
+        if opponent is not None:
+            ability = getattr(opponent, "ability", None)
+            if ability:
+                norm_ability = ability.lower().replace(" ", "").replace("-", "")
+                for idx, ab in enumerate(OPP_ABILITY_ORDER):
+                    if norm_ability == ab:
+                        vector[OPP_ABILITY_START + idx] = 1.0
+                        break
 
     def _opponent_role_posterior(self, opponent: Pokemon) -> Dict[str, float]:
         revealed_moves = list(opponent.moves.keys())

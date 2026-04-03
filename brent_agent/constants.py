@@ -48,7 +48,7 @@ REWARD_CONFIG = {
 
 DECISION_AUDIT_SAMPLE_LIMIT = 20
 
-MOVE_BLOCK_SIZE = 37  # 25 base + 5 status-move + 6 volatile/secondary + 1 multi-hit flag
+MOVE_BLOCK_SIZE = 38  # 37 base + 1 PP fraction
 MY_BENCH_SLOT_SIZE = 63  # 53 base + 5 matchup + 5 status (psn_sev, par, brn, slp, frz)
 OPP_BENCH_SLOT_SIZE = 20
 BENCH_MOVE_FLAG_SIZE = 8
@@ -78,7 +78,13 @@ OPP_THREAT_CONFIDENCE_START = OPP_THREAT_OHKO_START + 6
 ON_RECHARGE_INDEX = OPP_THREAT_CONFIDENCE_START + 2
 ALIVE_DIFF_INDEX = ON_RECHARGE_INDEX + 1
 FORCE_SWITCH_INDEX = ALIVE_DIFF_INDEX + 1
-VECTOR_LENGTH = FORCE_SWITCH_INDEX + 1
+# Extended tail features
+SPEED_RATIO_INDEX = FORCE_SWITCH_INDEX + 1
+MY_TAILWIND_INDEX = SPEED_RATIO_INDEX + 1
+OPP_TAILWIND_INDEX = MY_TAILWIND_INDEX + 1
+OPP_ABILITY_START = OPP_TAILWIND_INDEX + 1
+OPP_ABILITY_SIZE = 15
+VECTOR_LENGTH = OPP_ABILITY_START + OPP_ABILITY_SIZE
 
 TYPE_ORDER = (
     PokemonType.BUG,
@@ -136,6 +142,13 @@ SIDE_CONDITION_ORDER = (
     SideCondition.REFLECT,
     SideCondition.LIGHT_SCREEN,
     SideCondition.AURORA_VEIL,
+)
+
+OPP_ABILITY_ORDER = (
+    "levitate", "flashfire", "voltabsorb", "waterabsorb",
+    "lightningrod", "stormdrain", "motordrive", "sapsipper",
+    "dryskin", "sturdy", "multiscale", "shadowshield",
+    "intimidate", "magicbounce", "unaware",
 )
 
 PIVOT_MOVES = {"uturn", "voltswitch", "flipturn", "teleport"}
@@ -330,4 +343,5 @@ assert OPP_THREAT_OHKO_START + 6 == OPP_THREAT_CONFIDENCE_START
 assert OPP_THREAT_CONFIDENCE_START + 2 == ON_RECHARGE_INDEX
 assert ON_RECHARGE_INDEX + 1 == ALIVE_DIFF_INDEX
 assert ALIVE_DIFF_INDEX + 1 == FORCE_SWITCH_INDEX
-assert FORCE_SWITCH_INDEX + 1 == VECTOR_LENGTH
+assert FORCE_SWITCH_INDEX + 1 == SPEED_RATIO_INDEX
+assert OPP_ABILITY_START + OPP_ABILITY_SIZE == VECTOR_LENGTH
