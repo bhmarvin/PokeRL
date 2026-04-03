@@ -15,6 +15,7 @@ from poke_env.player.battle_order import BattleOrder, DefaultBattleOrder
 from poke_env.ps_client import AccountConfiguration
 
 from brent_agent import VECTOR_LENGTH, BrentObservationVectorBuilder
+from brent_agent.agent import BrentsRLAgent
 
 
 class SelfPlayPlayer(Player):
@@ -65,38 +66,9 @@ class SelfPlayPlayer(Player):
             return self.choose_default_move(battle)
 
     def _build_action_mask(self, battle: AbstractBattle) -> np.ndarray:
-        """Build the action mask matching SinglesEnv's action space."""
-        n_actions = 26  # 6 switch + 4 move + 4 mega + 4 z + 4 dmax + 4 tera
-        mask = np.zeros(n_actions, dtype=np.int64)
-
-        # Switches: actions 0-5
-        available_switches = battle.available_switches or []
-        team_list = list(battle.team.values())
-        non_active = [mon for mon in team_list if not mon.active]
-        for i, mon in enumerate(non_active[:6]):
-            if mon in available_switches and not mon.fainted:
-                mask[i] = 1
-
-        # Moves: actions 6-9
-        available_moves = battle.available_moves or []
-        for i, move in enumerate(available_moves[:4]):
-            mask[6 + i] = 1
-
-        # Tera moves: actions 22-25
-        if getattr(battle, "can_tera", False) and available_moves:
-            for i in range(min(len(available_moves), 4)):
-                mask[22 + i] = 1
-
-        # Force switch: only switches are legal
-        if getattr(battle, "force_switch", False):
-            for i in range(6, n_actions):
-                mask[i] = 0
-
-        # Ensure at least one action is legal
-        if not np.any(mask == 1):
-            mask[0] = 1  # fallback
-
-        return mask
+        """Build action mask using the same logic as BrentsRLAgent to avoid
+        index mismatches (especially the 5-move overflow bug fix)."""
+        return np.array(BrentsRLAgent.get_action_mask(battle), dtype=np.int64)
 
 
 class CheckpointPool:
