@@ -105,32 +105,3 @@ class SelfPlayPlayer(Player):
         """Build action mask using the same logic as BrentsRLAgent to avoid
         index mismatches (especially the 5-move overflow bug fix)."""
         return np.array(BrentsRLAgent.get_action_mask(battle), dtype=np.int64)
-
-
-class CheckpointPool:
-    """Manages a pool of historical checkpoints for league-style self-play.
-    Samples a random checkpoint from the pool as the opponent each game."""
-
-    def __init__(self, max_size: int = 5):
-        self.max_size = max_size
-        self.checkpoints: list[str] = []
-
-    def add(self, checkpoint_path: str) -> None:
-        """Add a checkpoint to the pool, evicting oldest if full."""
-        if checkpoint_path not in self.checkpoints:
-            self.checkpoints.append(checkpoint_path)
-            if len(self.checkpoints) > self.max_size:
-                self.checkpoints.pop(0)
-
-    def sample(self) -> Optional[str]:
-        """Sample a random checkpoint from the pool."""
-        if not self.checkpoints:
-            return None
-        return random.choice(self.checkpoints)
-
-    def latest(self) -> Optional[str]:
-        """Return the most recently added checkpoint."""
-        return self.checkpoints[-1] if self.checkpoints else None
-
-    def __len__(self) -> int:
-        return len(self.checkpoints)

@@ -25,7 +25,6 @@ from brent_agent import BrentsRLAgent, REWARD_CONFIG, VECTOR_LENGTH
 from experiment_io import make_run_name, prepare_run_artifacts, write_summary
 from opponents import OPPONENT_CHOICES, create_opponent
 from policies import MaskedActorCriticPolicy
-from self_play import CheckpointPool
 
 
 def format_penalty_report(report: dict[str, Any]) -> str:
@@ -139,6 +138,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-freq", type=int, default=10000, help="Evaluate every X steps")
     parser.add_argument("--learning-rate", type=float, default=3e-4,
                         help="PPO learning rate (default 3e-4, lower for curriculum transitions)")
+    parser.add_argument("--ent-coef", type=float, default=0.02,
+                        help="Entropy coefficient (default 0.02, higher values like 0.05 encourage exploration)")
+    parser.add_argument("--adaptive-start-tier", type=int, default=0,
+                        help="Starting tier for adaptive opponents (0=random, 1=maxpower, 2=heuristic, 3=selfplay)")
     return parser.parse_args()
 
 
@@ -155,12 +158,13 @@ def create_wrapped_env(args: argparse.Namespace, opponent_name: str) -> Monitor:
         log_level=args.log_level,
         start_listening=False,
         checkpoint_path=getattr(args, "self_play_checkpoint", None),
+        start_tier=getattr(args, "adaptive_start_tier", 0),
     )
     return Monitor(SingleAgentWrapper(env, opponent))
 
 
 def _make_env_fn(opponent_name: str, battle_format: str, log_level: int,
-                  checkpoint_path: str | None = None):
+                  checkpoint_path: str | None = None, start_tier: int = 0):
     """Lazy factory — all poke_env objects are created inside the subprocess."""
     def _init():
         env = BrentsRLAgent(
@@ -175,6 +179,7 @@ def _make_env_fn(opponent_name: str, battle_format: str, log_level: int,
             log_level=log_level,
             start_listening=False,
             checkpoint_path=checkpoint_path,
+            start_tier=start_tier,
         )
         return Monitor(SingleAgentWrapper(env, opponent))
     return _init
@@ -201,7 +206,8 @@ def create_vec_env(args: argparse.Namespace) -> SubprocVecEnv:
         )
     return SubprocVecEnv([
         _make_env_fn(opp, args.battle_format, args.log_level,
-                      checkpoint_path=getattr(args, "self_play_checkpoint", None))
+                      checkpoint_path=getattr(args, "self_play_checkpoint", None),
+                      start_tier=getattr(args, "adaptive_start_tier", 0))
         for opp in opponents
     ])
 
@@ -305,7 +311,6 @@ class PokeEnvEvalCallback(BaseCallback):
         best_model_save_path: str,
         log_path: str,
         tracked_env: BrentsRLAgent | None = None,
-        checkpoint_pool: CheckpointPool | None = None,
         verbose: int = 1,
     ):
         super().__init__(verbose)
@@ -315,7 +320,6 @@ class PokeEnvEvalCallback(BaseCallback):
         self.best_model_save_path = best_model_save_path
         self.log_path = log_path
         self.tracked_env = tracked_env
-        self.checkpoint_pool = checkpoint_pool
         self.best_mean_reward = -np.inf
 
     def _on_step(self) -> bool:
@@ -406,24 +410,22 @@ class PokeEnvEvalCallback(BaseCallback):
             self.model.save(best_path)
             if self.verbose:
                 print(f"  New best model saved (reward={mean_reward:.3f})")
-            if self.checkpoint_pool is not None:
-                self.checkpoint_pool.add(best_path)
-                if self.verbose:
-                    print(f"  Checkpoint pool updated (size={len(self.checkpoint_pool)})")
 
         return True
 
 
-def build_model(args: argparse.Namespace, env: Monitor) -> PPO:
+def build_model(args: argparse.Namespace, env: Monitor, run_name: str = "") -> PPO:
+    tb_log_dir = os.path.join(args.output_dir, "logs", run_name) if run_name else os.path.join(args.output_dir, "logs")
+
     if args.resume_from:
         print(f"Loading PPO checkpoint from {args.resume_from}")
         model = PPO.load(
             args.resume_from, env=env, device=args.device,
-            tensorboard_log=os.path.join(args.output_dir, "logs"),
-            custom_objects={"learning_rate": args.learning_rate, "ent_coef": 0.02, "n_steps": 4096, "batch_size": 256},
+            tensorboard_log=tb_log_dir,
+            custom_objects={"learning_rate": args.learning_rate, "ent_coef": args.ent_coef, "n_steps": 4096, "batch_size": 256},
         )
         print(f"  learning_rate overridden to {args.learning_rate}")
-        print(f"  ent_coef overridden to 0.02")
+        print(f"  ent_coef overridden to {args.ent_coef}")
         return model
 
     base_lr = args.learning_rate
@@ -436,11 +438,11 @@ def build_model(args: argparse.Namespace, env: Monitor) -> PPO:
         n_steps=4096,
         batch_size=256,
         gamma=0.99,
-        ent_coef=0.02,
+        ent_coef=args.ent_coef,
         device=args.device,
         seed=args.seed,
         verbose=1,
-        tensorboard_log=os.path.join(args.output_dir, "logs"),
+        tensorboard_log=tb_log_dir,
     )
 
 
@@ -484,7 +486,7 @@ def main() -> None:
         env.reset(seed=args.seed)
         train_env = env.unwrapped.env
 
-    model = build_model(args, env)
+    model = build_model(args, env, run_name=run_name)
 
     try:
         if args.train_timesteps > 0:
@@ -497,13 +499,9 @@ def main() -> None:
                 name_prefix="rl_model",
             )
 
-            # Set up checkpoint pool for self-play tracking
-            sp_pool: CheckpointPool | None = None
+            # Seed the self-play checkpoint path so weight refresh works
+            # from the start (opponent reloads from this path as training saves new bests)
             if args.self_play_checkpoint:
-                sp_pool = CheckpointPool()
-                sp_pool.add(args.self_play_checkpoint)
-                # Seed the self-play checkpoint path so weight refresh works
-                # from the start (opponent reloads from this path as training saves new bests)
                 if not os.path.exists(args.self_play_checkpoint) and args.resume_from:
                     os.makedirs(os.path.dirname(args.self_play_checkpoint), exist_ok=True)
                     import shutil
@@ -517,7 +515,6 @@ def main() -> None:
                 best_model_save_path=os.path.join(artifacts["run_dir"], "best_model"),
                 log_path=artifacts["run_dir"],
                 tracked_env=train_env,
-                checkpoint_pool=sp_pool,
             )
 
             model.learn(

@@ -6,6 +6,7 @@ The environment reward is the sum of:
 1. `poke_env`'s state-delta reward from `reward_computing_helper(...)`
 2. Tactical shaping from positive and negative lever evaluators
 3. Head hunter bonus for KOing high-threat opponent mons
+4. Predicted switch bonus (retrospective reward for good switches)
 
 The reward entry point is `BrentsRLAgent.calc_reward(battle)`.
 
@@ -16,22 +17,26 @@ REWARD_CONFIG = {
     "hp_value": 0.5,
     "status_value": 0.25,
     "victory_value": 15.0,
-    "penalty_redundant_stealthrock": -0.05,
-    "penalty_redundant_stickyweb": -0.05,
-    "penalty_redundant_spikes": -0.05,
+    "penalty_redundant_stealthrock": -0.15,
+    "penalty_redundant_stickyweb": -0.15,
+    "penalty_redundant_spikes": -0.15,
     "penalty_redundant_status": -0.05,
     "penalty_bad_encore": -0.05,
     "penalty_ineffective_heal": -0.05,
     "penalty_wasteful_heal_overflow": -0.025,
     "penalty_redundant_self_drop_move": -0.05,
-    "penalty_unsafe_stay_in_with_fast_ko_switch": -0.1,
+    "penalty_unsafe_stay_in_with_fast_ko_switch": -0.2,
     "bonus_good_heal_timing": 0.2,
-    "bonus_good_attack_selection": 0.0,
+    "bonus_good_attack_selection": 0.10,
     "bonus_good_safe_switch": 0.2,
     "bonus_good_tera": 0.5,
     "penalty_abandon_boosted_mon": -0.05,
-    "penalty_heal_satiation": -0.05,
+    "penalty_heal_satiation": -0.15,
     "penalty_wasted_free_switch": 0.0,
+    "bonus_good_setup": 0.25,
+    "bonus_pivot_into_advantage": 0.15,
+    "bonus_predicted_switch": 0.3,
+    "penalty_redundant_taunt": -0.15,
 }
 ```
 
@@ -54,25 +59,35 @@ Custom shaping applied on top of the base reward. Driven by pre-action evaluatio
 
 ### Bonuses
 
-**good_heal_timing (+0.2):** Recovery used when HP ≤ 60%, effective heal ≥ 20%, overflow ≤ 15%, and under pressure (HP ≤ 35% or opponent max threat ≥ 45% or OHKO risk ≥ 15%).
+**good_heal_timing (+0.2):** Recovery used when HP <= 60%, effective heal >= 20%, overflow <= 15%, and under pressure (HP <= 35% or opponent max threat >= 45% or OHKO risk >= 15%).
 
-**good_safe_switch (+0.2):** Switch target resists all opponent threatening moves (type mult ≤ 0.5), isn't itself threatened (max incoming ≤ 45%, OHKO risk ≤ 15%), has a credible reply, and improves board position by ≥ 0.15 on threat or OHKO risk.
+**good_attack_selection (+0.10):** Bonus for choosing the highest-EV move when multiple options exist.
+
+**good_safe_switch (+0.2):** Switch target resists all opponent threatening moves (type mult <= 0.5), isn't itself threatened (max incoming <= 45%, OHKO risk <= 15%), has a credible reply, and improves board position by >= 0.15 on threat or OHKO risk.
 
 **good_tera (+0.5):** Terastallizing gains a defensive immunity to the opponent's last move type, or enables a KO by upgrading STAB past the opponent's remaining HP.
+
+**good_setup (+0.25):** Using a stat-boosting move in a safe context (not about to be KO'd, opponent can't easily punish).
+
+**pivot_into_advantage (+0.15):** Using a pivot move (U-turn, Volt Switch, etc.) that switches into a mon with a type or matchup advantage.
+
+**predicted_switch (+0.3):** Retrospective reward applied when a previous switch turns out to have been correct (the mon that switched in successfully handles the opponent's next action).
 
 **head_hunter_bonus (+0.25/teammate, capped +0.75):** Extra reward for KOing an opponent mon that could OHKO multiple teammates. Scales with how many of your team it threatened.
 
 ### Penalties
 
-**unsafe_stay_in (-0.1):** Attacking when outsped for KO and a safe switch exists that is faster, resists all threats, and can KO the opponent.
+**unsafe_stay_in (-0.2):** Attacking when outsped for KO and a safe switch exists that is faster, resists all threats, and can KO the opponent.
 
-**abandon_boosted_mon (-0.05):** Switching out a mon with ≥+2 offensive boosts that has >50% HP and outspeeds the opponent.
+**abandon_boosted_mon (-0.05):** Switching out a mon with >=+2 offensive boosts that has >50% HP and outspeeds the opponent.
 
-**heal_satiation (-0.05):** Using a heal move 3+ consecutive turns on the same mon.
+**heal_satiation (-0.15):** Using a heal move 3+ consecutive turns on the same mon.
+
+**redundant_taunt (-0.15):** Using Taunt on a target that is already taunted.
 
 **wasted_free_switch (0.0):** Disabled. Was -0.1 for switching out a mon on the turn after it entered via forced switch, but has bad credit assignment (penalizes current decision for a previous turn's mistake).
 
-**redundant_hazards (-0.05):** Setting Stealth Rock/Sticky Web when already up, or Spikes at 3 layers.
+**redundant_hazards (-0.15):** Setting Stealth Rock/Sticky Web when already up, or Spikes at 3 layers.
 
 **redundant_status (-0.05):** Using a status move on an already-statused opponent.
 
@@ -82,7 +97,7 @@ Custom shaping applied on top of the base reward. Driven by pre-action evaluatio
 
 ## Design Notes
 - Tactical shaping is based on **pre-action state**, not post-action state.
-- Penalties are intentionally small (half their original values) to prevent the agent from learning to avoid penalties rather than learning to win.
+- Hazard/taunt/heal penalties have been increased to -0.15 to discourage repetitive play patterns that waste turns.
 - The pos/neg shaping ratio should stay close to 1:1 during healthy training. If negatives dominate 3:1+, the agent becomes risk-averse.
 - `wasted_free_switch` is kept at 0.0 (audit-only) because it requires multi-turn credit assignment that confuses early training.
 - The environment exposes `get_strategic_penalty_report()` and `get_tactical_shaping_report()` for monitoring shaping health.

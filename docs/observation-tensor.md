@@ -1,13 +1,13 @@
 # Observation Tensor
 
 ## Summary
-The policy consumes a single flat observation vector of length `758`.
+The policy consumes a single flat observation vector of length `780`.
 
 The raw tensor is built by `BrentObservationVectorBuilder.embed_battle(battle)` and is exposed to PPO as:
 
 ```python
 {
-    "observation": np.ndarray(shape=(758,), dtype=np.float32),
+    "observation": np.ndarray(shape=(780,), dtype=np.float32),
     "action_mask": np.ndarray(shape=(action_space,), dtype=np.int64),
 }
 ```
@@ -28,17 +28,21 @@ Index ranges:
 | 24–83 | 60 | My active Pokemon block |
 | 84–124 | 41 | Opponent active Pokemon block |
 | 125 | 1 | Speed advantage flag |
-| 126–273 | 148 | My available move blocks (4 × 37) |
-| 274–588 | 315 | My bench blocks (5 × 63) |
-| 589–688 | 100 | Opponent bench blocks (5 × 20) |
-| 689–708 | 20 | Targeting matrix (4 moves × 5 bench targets) |
-| 709–714 | 6 | My team reveal-memory flags |
-| 715–746 | 32 | Opponent threat rows (4 × 8) |
-| 747–752 | 6 | Opponent OHKO risk vs my team (6 slots) |
-| 753–754 | 2 | Role posterior confidence summary |
-| 755 | 1 | On-recharge flag |
-| 756 | 1 | Alive count differential |
-| 757 | 1 | Force switch flag |
+| 126–277 | 152 | My available move blocks (4 × 38) |
+| 278–592 | 315 | My bench blocks (5 × 63) |
+| 593–692 | 100 | Opponent bench blocks (5 × 20) |
+| 693–712 | 20 | Targeting matrix (4 moves × 5 bench targets) |
+| 713–718 | 6 | My team reveal-memory flags |
+| 719–750 | 32 | Opponent threat rows (4 × 8) |
+| 751–756 | 6 | Opponent OHKO risk vs my team (6 slots) |
+| 757–758 | 2 | Role posterior confidence summary |
+| 759 | 1 | On-recharge flag |
+| 760 | 1 | Alive count differential |
+| 761 | 1 | Force switch flag |
+| 762 | 1 | Speed ratio (continuous) |
+| 763 | 1 | My tailwind flag |
+| 764 | 1 | Opponent tailwind flag |
+| 765–779 | 15 | Opponent ability one-hot |
 
 ## Side Conditions Block
 Each side (my and opponent) has 7 features:
@@ -83,7 +87,7 @@ Opponent active tera extension (+1 feature, offset 40):
 Opponent tera type is already reflected in the type one-hot via `_effective_types`.
 
 ## Available Move Block
-Each move block is 37 features. 4 move slots, unfilled slots stay zero.
+Each move block is 38 features. 4 move slots, unfilled slots stay zero.
 
 | Offset | Feature | Range |
 |--------|---------|-------|
@@ -124,6 +128,7 @@ Each move block is 37 features. 4 move slots, unfilled slots stay zero.
 | +34 | Target spe drop chance | [0, 1] |
 | +35 | Target accuracy drop chance | [0, 1] |
 | +36 | Multi-hit flag | {0, 1} |
+| +37 | PP fraction (current / max) | [0, 1] |
 
 Status/flinch/stat-drop chances are **ability-aware**: Serene Grace doubles secondary chances; Sheer Force zeroes them.
 
@@ -189,9 +194,18 @@ For each of your up-to-4 available moves, the expected damage % against each of 
 
 | Index | Feature | Range |
 |-------|---------|-------|
-| 755 | On recharge (must recharge volatile) | {0, 1} |
-| 756 | Alive count differential ((mine - theirs) / 6) | [-1, 1] |
-| 757 | Force switch (forced to switch due to faint) | {0, 1} |
+| 759 | On recharge (must recharge volatile) | {0, 1} |
+| 760 | Alive count differential ((mine - theirs) / 6) | [-1, 1] |
+| 761 | Force switch (forced to switch due to faint) | {0, 1} |
+
+## Extended Tail Features
+
+| Index | Feature | Range |
+|-------|---------|-------|
+| 762 | Speed ratio (my speed / (my speed + opp speed)) | [0, 1] |
+| 763 | My tailwind active | {0, 1} |
+| 764 | Opponent tailwind active | {0, 1} |
+| 765–779 | Opponent ability one-hot (15 tracked abilities) | {0, 1} |
 
 ## Damage Source
 Damage percentages come from `_damage_range_percent(...)`, which uses:
@@ -203,7 +217,7 @@ Damage percentages come from `_damage_range_percent(...)`, which uses:
 
 ## Main Symbols
 ```python
-VECTOR_LENGTH = 758
+VECTOR_LENGTH = 780
 def embed_battle(self, battle: AbstractBattle) -> np.ndarray
 def verify_battle_embedding(self, battle: AbstractBattle, vector: np.ndarray) -> list[str]
 ```

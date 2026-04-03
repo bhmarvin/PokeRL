@@ -39,6 +39,7 @@ def create_opponent(
     log_level: int,
     start_listening: bool = False,
     checkpoint_path: str | None = None,
+    start_tier: int = 0,
 ) -> Player:
     if opponent_name == "self_play":
         if checkpoint_path is None:
@@ -60,6 +61,7 @@ def create_opponent(
             log_level=log_level,
             start_listening=start_listening,
             checkpoint_path=checkpoint_path,
+            start_tier=start_tier,
         )
 
     try:

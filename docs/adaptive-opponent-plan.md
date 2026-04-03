@@ -49,13 +49,18 @@ class AdaptivePlayer(Player):
 - Hook into `SingleAgentWrapper` or the eval callback to call `record_result()`
 - Could also override `BrentsRLAgent.calc_reward` to track — it already sees `battle.won`
 
-## Implementation Steps
+## Implementation Steps (DONE)
 
-1. **Create `adaptive_opponent.py`** with `AdaptivePlayer` class (~80 lines)
-2. **Add `"adaptive"` to `OPPONENT_CHOICES`** in `opponents.py`
-3. **Wire result tracking** — after each battle ends, call `record_result(won)`
-4. **CLI args**: `--adaptive-checkpoint` for the self-play tier
-5. **Logging**: print current tier + win rate at each eval checkpoint
+1. ~~**Create `adaptive_opponent.py`** with `AdaptivePlayer` class~~
+2. ~~**Add `"adaptive"` to `OPPONENT_CHOICES`** in `opponents.py`~~
+3. ~~**Wire result tracking** — uses battle object reference, checks `battle.won` on battle transition~~
+4. ~~**CLI args**: `--self-play-checkpoint` for the self-play tier~~
+5. ~~**Logging**: prints PROMOTED/DEMOTED messages with `flush=True` for SubprocVecEnv visibility~~
+
+### Implementation Notes
+- Result tracking uses `_check_prev_battle_result()` which detects battle transitions via `battle_tag` changes, rather than hooking into `calc_reward`.
+- `--adaptive-start-tier` CLI arg added to skip easy tiers for late-stage training (e.g., `--adaptive-start-tier 2` starts at heuristic).
+- SubprocVecEnv workers use `print(..., flush=True)` to ensure PROMOTED/DEMOTED messages are visible in the parent process.
 
 ## Wiring into SubprocVecEnv
 

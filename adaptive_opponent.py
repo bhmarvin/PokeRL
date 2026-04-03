@@ -43,6 +43,7 @@ class AdaptivePlayer(Player):
         start_listening: bool = False,
         checkpoint_path: str | None = None,
         window: int = DEFAULT_WINDOW,
+        start_tier: int = 0,
     ):
         uid = f"{os.getpid()}{''.join(_rng.choices(_str.ascii_lowercase, k=4))}"
         super().__init__(
@@ -56,7 +57,6 @@ class AdaptivePlayer(Player):
 
         self._window = window
         self._recent_results: deque[bool] = deque(maxlen=window)
-        self._current_idx = 0
         self._prev_battle_tag: str | None = None
         self._prev_battle: AbstractBattle | None = None
 
@@ -68,6 +68,21 @@ class AdaptivePlayer(Player):
             checkpoint_path=checkpoint_path,
             uid_base=uid,
         )
+
+        # Apply start tier (clamp to valid range)
+        clamped = min(start_tier, len(self._opponents) - 1)
+        self._current_idx = clamped
+        if clamped != start_tier:
+            print(
+                f"[AdaptiveOpponent] start_tier={start_tier} clamped to {clamped} "
+                f"(ladder has {len(self._opponents)} tiers)",
+                flush=True,
+            )
+        if clamped > 0:
+            print(
+                f"[AdaptiveOpponent] starting at tier {clamped} ({self.current_tier_name})",
+                flush=True,
+            )
 
     @staticmethod
     def _build_ladder(
@@ -154,12 +169,14 @@ class AdaptivePlayer(Player):
             self._recent_results.clear()
             print(
                 f"[AdaptiveOpponent] PROMOTED to tier {self._current_idx} "
-                f"({self.current_tier_name}) — agent WR was {win_rate:.0%}"
+                f"({self.current_tier_name}) — agent WR was {win_rate:.0%}",
+                flush=True,
             )
         elif win_rate < DEMOTE_THRESHOLD and self._current_idx > 0:
             self._current_idx -= 1
             self._recent_results.clear()
             print(
                 f"[AdaptiveOpponent] DEMOTED to tier {self._current_idx} "
-                f"({self.current_tier_name}) — agent WR was {win_rate:.0%}"
+                f"({self.current_tier_name}) — agent WR was {win_rate:.0%}",
+                flush=True,
             )

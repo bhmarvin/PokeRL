@@ -70,6 +70,10 @@ def parse_args() -> argparse.Namespace:
                         help="Stage to start from (1-indexed, default=1)")
     parser.add_argument("--resume-from", help="Checkpoint to resume stage 1 from")
     parser.add_argument("--output-dir", default="results/ppo")
+    parser.add_argument("--ent-coef", type=float, default=0.02,
+                        help="Entropy coefficient (passed to all stages)")
+    parser.add_argument("--adaptive-start-tier", type=int, default=0,
+                        help="Starting tier for adaptive opponents (passed to all stages)")
     return parser.parse_args()
 
 
@@ -89,6 +93,8 @@ def run_stage(
     output_dir: str,
     resume_from: str | None,
     stage_num: int,
+    ent_coef: float = 0.02,
+    adaptive_start_tier: int = 0,
 ) -> str | None:
     """Run one training stage. Returns path to best checkpoint, or None on failure."""
     run_name = f"{prefix}_{stage['name']}"
@@ -99,6 +105,7 @@ def run_stage(
     print(f"  n_envs: {stage['n_envs']}")
     print(f"  eval: {stage['eval_battles']} battles vs {stage['eval_opponent']}")
     print(f"  lr: {stage['lr']}")
+    print(f"  ent_coef: {ent_coef}")
     if resume_from:
         print(f"  resume_from: {resume_from}")
     print(f"{'='*60}\n")
@@ -113,6 +120,8 @@ def run_stage(
         "--eval-battles", str(stage["eval_battles"]),
         "--device", device,
         "--learning-rate", str(stage["lr"]),
+        "--ent-coef", str(ent_coef),
+        "--adaptive-start-tier", str(adaptive_start_tier),
         "--run-name", run_name,
         "--output-dir", output_dir,
     ]
@@ -170,6 +179,8 @@ def main() -> None:
             output_dir=args.output_dir,
             resume_from=resume_from,
             stage_num=i,
+            ent_coef=args.ent_coef,
+            adaptive_start_tier=args.adaptive_start_tier,
         )
 
         if checkpoint is None:
