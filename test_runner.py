@@ -110,6 +110,12 @@ class FakePokemon:
         }
     )
     last_move: Optional[FakeMove] = None
+    base_species: str = ""
+    available_z_moves: list = field(default_factory=list)
+
+    def __post_init__(self):
+        if not self.base_species:
+            self.base_species = self.species
 
     @property
     def type_1(self) -> PokemonType:
@@ -143,6 +149,12 @@ class FakeBattle:
     opponent_side_conditions: dict = field(default_factory=dict)
     finished: bool = False
     can_tera: bool = False
+    trapped: bool = False
+    _wait: bool = False
+    can_mega_evolve: bool = False
+    can_z_move: bool = False
+    can_dynamax: bool = False
+    gen: int = 9
 
 
 class FakeMeta:
@@ -1306,6 +1318,112 @@ def main() -> None:
     print("  Backward compatible (attacker=None): PASS")
 
     print("  All volatile effect + ability tests passed!")
+
+    # =========================================================
+    # Action mask smoke test: Ditto Transform 5-move collision
+    # =========================================================
+    print("\n-- Action mask 5-move collision test ---------------")
+    from poke_env.environment.singles_env import SinglesEnv
+
+    # Simulate a Ditto that Transformed: its moves dict has the original
+    # "transform" plus 4 copied moves.  Only the 4 copied moves are in
+    # available_moves, but the moves dict has 5 entries total.
+    ditto = FakePokemon(
+        name="Ditto", species="ditto",
+        types=(PokemonType.NORMAL,),
+        current_hp_fraction=1.0,
+        active=True,
+    )
+    # Original move (index 0 in moves dict) — NOT available after Transform
+    transform_move = FakeMove(id="transform")
+    # 4 copied moves (indices 1-4) — these ARE available
+    heavyslam = FakeMove(id="heavyslam", base_power=120, category=MoveCategory.PHYSICAL, type=PokemonType.STEEL)
+    stealthrock = FakeMove(id="stealthrock", base_power=0, category=MoveCategory.STATUS, type=PokemonType.ROCK)
+    earthquake = FakeMove(id="earthquake", base_power=100, category=MoveCategory.PHYSICAL, type=PokemonType.GROUND)
+    roar = FakeMove(id="roar", base_power=0, category=MoveCategory.STATUS, type=PokemonType.NORMAL)
+
+    ditto.moves = OrderedDict([
+        ("transform", transform_move),
+        ("heavyslam", heavyslam),
+        ("stealthrock", stealthrock),
+        ("earthquake", earthquake),
+        ("roar", roar),
+    ])
+
+    lugia = FakePokemon(
+        name="Lugia", species="lugia",
+        types=(PokemonType.PSYCHIC, PokemonType.FLYING),
+        current_hp_fraction=1.0,
+    )
+
+    mask_battle = FakeBattle(
+        battle_tag="mask-test",
+        player_role="p1",
+        opponent_role="p2",
+        active_pokemon=ditto,
+        opponent_active_pokemon=FakePokemon(
+            name="Foe", species="garchomp",
+            types=(PokemonType.DRAGON, PokemonType.GROUND),
+            current_hp_fraction=1.0,
+        ),
+        available_moves=[heavyslam, stealthrock, earthquake, roar],
+        team=OrderedDict([
+            ("p1a", ditto),
+            ("p1b", lugia),
+        ]),
+        opponent_team=OrderedDict([
+            ("p2a", FakePokemon(
+                name="Foe", species="garchomp",
+                types=(PokemonType.DRAGON, PokemonType.GROUND),
+                current_hp_fraction=1.0,
+            )),
+        ]),
+        available_switches=[lugia],
+    )
+
+    mask = SinglesEnv.get_action_mask(mask_battle)
+    action_space_size = SinglesEnv.get_action_space_size(9)  # 26
+    assert len(mask) == action_space_size, f"mask length {len(mask)} != {action_space_size}"
+
+    # The 4 available moves should map to actions 7, 8, 9, 10 in the
+    # current (buggy) poke_env code because enumerate() doesn't cap at 4.
+    # Actions 6-9 are "move 0-3 plain".  Actions 10-13 are "move 0-3 mega".
+    #
+    # If i=4 (roar, 5th entry) -> action 10 is in move_space, but
+    # action_to_order interprets 10 as "move index 0 + mega" = transform mega.
+    #
+    # EXPECTED (correct): only actions 7,8,9 should be legal plain moves
+    #   (indices 1-3 in the 4-move window), and action 6 (transform) should
+    #   be masked out because transform is not in available_moves.
+    #   Roar should NOT produce action 10 — it overflows the 4-move window.
+    #
+    # ACTUAL (bug): action 10 is set to 1, colliding with mega move 0.
+
+    # Detect the bug:
+    move_actions_set = [i for i in range(6, 10) if mask[i] == 1]   # plain moves: 6-9
+    mega_zone_set = [i for i in range(10, 14) if mask[i] == 1]     # mega moves: 10-13
+
+    # In the buggy mask, roar (index 4) overflows to action 10, landing in
+    # the mega zone even though can_mega_evolve is False.
+    bug_detected = any(mask[i] == 1 for i in range(10, 14))
+    if bug_detected:
+        print(f"  BUG CONFIRMED: mask has legal actions in mega zone {mega_zone_set}")
+        print(f"    plain move actions: {move_actions_set}")
+        print(f"    This will crash when action_to_order interprets action 10")
+        print(f"    as 'move 0 + mega' instead of 'move 4 plain'.")
+        print("  Action mask 5-move collision: BUG DETECTED (expected)")
+    else:
+        print("  No collision detected — bug may be fixed upstream.")
+        print(f"    plain move actions: {move_actions_set}")
+
+    # Also verify: action 6 (transform, index 0) should NOT be legal
+    if mask[6] == 1:
+        print("  WARNING: transform (action 6) is marked legal but not in available_moves!")
+
+    # Count total legal actions for sanity
+    legal_count = sum(mask)
+    print(f"  Total legal actions in mask: {legal_count}")
+    print(f"  Full mask: {mask}")
 
     print("\n== ALL TESTS PASSED ==")
 

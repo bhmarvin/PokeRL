@@ -44,10 +44,12 @@ def create_opponent(
             f"Unsupported opponent '{opponent_name}'. Choices: {', '.join(OPPONENT_CHOICES)}"
         ) from exc
 
+    import os, random as _rng, string as _str
+    _uid = f"{os.getpid()}{''.join(_rng.choices(_str.ascii_lowercase, k=4))}"
     return opponent_cls(
         account_configuration=AccountConfiguration.generate(
-            _ACCOUNT_PREFIXES[opponent_name],
-            rand=True,
+            f"{_ACCOUNT_PREFIXES[opponent_name]}{_uid}",
+            rand=False,
         ),
         battle_format=battle_format,
         start_listening=start_listening,

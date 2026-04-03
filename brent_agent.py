@@ -2148,13 +2148,15 @@ class BrentObservationVectorBuilder:
 
 class BrentsRLAgent(SinglesEnv):
     def __init__(self, *args, **kwargs) -> None:
+        import os, random, string
+        _uid = f"{os.getpid()}{''.join(random.choices(string.ascii_lowercase, k=4))}"
         kwargs.setdefault(
             "account_configuration1",
-            AccountConfiguration.generate("PokeRL", rand=True),
+            AccountConfiguration.generate(f"RL{_uid}", rand=False),
         )
         kwargs.setdefault(
             "account_configuration2",
-            AccountConfiguration.generate("PokeRLOpp", rand=True),
+            AccountConfiguration.generate(f"RLO{_uid}", rand=False),
         )
         super().__init__(*args, **kwargs)
         self.vector_builder = BrentObservationVectorBuilder()

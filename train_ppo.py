@@ -406,9 +406,10 @@ def build_model(args: argparse.Namespace, env: Monitor) -> PPO:
         model = PPO.load(
             args.resume_from, env=env, device=args.device,
             tensorboard_log=os.path.join(args.output_dir, "logs"),
-            custom_objects={"learning_rate": args.learning_rate},
+            custom_objects={"learning_rate": args.learning_rate, "ent_coef": 0.02},
         )
         print(f"  learning_rate overridden to {args.learning_rate}")
+        print(f"  ent_coef overridden to 0.02")
         return model
 
     return PPO(
