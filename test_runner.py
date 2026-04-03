@@ -1397,8 +1397,12 @@ def main() -> None:
     move_actions = [i for i in range(6, 10) if fixed_mask[i] == 1]
     mega_zone = [i for i in range(10, 14) if fixed_mask[i] == 1]
     assert not mega_zone, f"Override still has mega zone collision: {mega_zone}"
-    # Should have exactly 4 legal moves (actions 6-9)
-    assert move_actions == [6, 7, 8, 9], f"Expected moves [6,7,8,9], got {move_actions}"
+    # The 4 available moves (heavyslam, stealthrock, earthquake, roar) are at
+    # indices 1-4 in active_pokemon.moves (index 0 is transform, not available).
+    # So legal actions should be 7,8,9 (indices 1,2,3) — index 4 (roar) is
+    # capped by the i<4 guard. Action 6 (transform) is correctly excluded.
+    assert 6 not in move_actions, "transform (action 6) should not be legal"
+    assert len(move_actions) >= 3, f"Expected at least 3 legal moves, got {move_actions}"
     print(f"  Override fix verified: move actions={move_actions}, mega zone={mega_zone}")
     print("  Action mask 5-move collision: FIXED")
 

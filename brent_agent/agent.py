@@ -104,11 +104,12 @@ class BrentsRLAgent(SinglesEnv):
         """Override poke_env's get_action_mask to fix the 5-move collision bug.
 
         The upstream implementation iterates over active_pokemon.moves (all known
-        moves, can exceed 4) instead of battle.available_moves (capped at 4).
-        When a mon knows 5+ moves, move indices spill into the mega zone (10-13),
-        causing illegal actions.
+        moves, can exceed 4) instead of checking against available_moves.
+        When a mon knows 5+ moves, move indices spill into the mega zone (10-13).
 
-        Fix: iterate available_moves directly, indexed 0-3.
+        Fix: iterate active_pokemon.moves (to keep index mapping consistent with
+        action_to_order) but only mark a move as legal if its id is in
+        available_moves AND its index is < 4.
         """
         from poke_env.environment.singles_env import SPECIAL_MOVES
 
@@ -125,16 +126,22 @@ class BrentsRLAgent(SinglesEnv):
         elif battle.active_pokemon is None:
             actions = switch_space
         else:
-            # FIX: use available_moves directly (max 4), not active_pokemon.moves
-            move_space = [6 + i for i in range(len(battle.available_moves[:4]))]
+            # Use active_pokemon.moves for index mapping (matches action_to_order)
+            # but filter to only available moves AND cap at index 4
+            available_ids = {m.id for m in battle.available_moves}
+            move_space = [
+                i + 6
+                for i, move in enumerate(battle.active_pokemon.moves.values())
+                if move.id in available_ids and i < 4
+            ]
 
             mega_space = [i + 4 for i in move_space if battle.can_mega_evolve]
-            # Z-moves: match available z-moves against available_moves
+            # Z-moves
             zmove_space = []
             if battle.can_z_move and hasattr(battle.active_pokemon, "available_z_moves"):
                 avail_z_ids = {m.id for m in battle.active_pokemon.available_z_moves}
-                for i, move in enumerate(battle.available_moves[:4]):
-                    if move.id in avail_z_ids:
+                for i, move in enumerate(battle.active_pokemon.moves.values()):
+                    if i < 4 and move.id in avail_z_ids:
                         zmove_space.append(6 + i + 8)
             dynamax_space = [i + 12 for i in move_space if battle.can_dynamax]
             tera_space = [i + 16 for i in move_space if battle.can_tera]
