@@ -24,7 +24,18 @@ from poke_env.environment.single_agent_wrapper import SingleAgentWrapper
 from brent_agent import BrentsRLAgent, REWARD_CONFIG, VECTOR_LENGTH
 from experiment_io import make_run_name, prepare_run_artifacts, write_summary
 from opponents import OPPONENT_CHOICES, create_opponent
+from poke_env.ps_client.server_configuration import (
+    LocalhostServerConfiguration,
+    ServerConfiguration,
+)
 from policies import MaskedActorCriticPolicy
+
+
+def _make_server_config(port: int) -> ServerConfiguration:
+    return ServerConfiguration(
+        f"ws://localhost:{port}/showdown/websocket",
+        "https://play.pokemonshowdown.com/action.php?",
+    )
 
 
 def format_penalty_report(report: dict[str, Any]) -> str:
@@ -142,15 +153,21 @@ def parse_args() -> argparse.Namespace:
                         help="Entropy coefficient (default 0.02, higher values like 0.05 encourage exploration)")
     parser.add_argument("--adaptive-start-tier", type=int, default=0,
                         help="Starting tier for adaptive opponents (0=random, 1=maxpower, 2=heuristic, 3=selfplay)")
+    parser.add_argument("--pool-size", type=int, default=6,
+                        help="Max checkpoint pool size for PFSP self-play (default 6)")
+    parser.add_argument("--server-ports", default="8000",
+                        help="Comma-separated ports for Showdown servers (workers distributed round-robin)")
     return parser.parse_args()
 
 
-def create_wrapped_env(args: argparse.Namespace, opponent_name: str) -> Monitor:
+def create_wrapped_env(args: argparse.Namespace, opponent_name: str,
+                       server_configuration: ServerConfiguration = LocalhostServerConfiguration) -> Monitor:
     env = BrentsRLAgent(
         battle_format=args.battle_format,
         log_level=args.log_level,
         open_timeout=None,
         strict=True,
+        server_configuration=server_configuration,
     )
     opponent = create_opponent(
         opponent_name,
@@ -159,12 +176,14 @@ def create_wrapped_env(args: argparse.Namespace, opponent_name: str) -> Monitor:
         start_listening=False,
         checkpoint_path=getattr(args, "self_play_checkpoint", None),
         start_tier=getattr(args, "adaptive_start_tier", 0),
+        server_configuration=server_configuration,
     )
     return Monitor(SingleAgentWrapper(env, opponent))
 
 
 def _make_env_fn(opponent_name: str, battle_format: str, log_level: int,
-                  checkpoint_path: str | None = None, start_tier: int = 0):
+                  checkpoint_path: str | None = None, start_tier: int = 0,
+                  server_configuration: ServerConfiguration = LocalhostServerConfiguration):
     """Lazy factory — all poke_env objects are created inside the subprocess."""
     def _init():
         env = BrentsRLAgent(
@@ -172,6 +191,7 @@ def _make_env_fn(opponent_name: str, battle_format: str, log_level: int,
             log_level=log_level,
             open_timeout=None,
             strict=True,
+            server_configuration=server_configuration,
         )
         opponent = create_opponent(
             opponent_name,
@@ -180,6 +200,7 @@ def _make_env_fn(opponent_name: str, battle_format: str, log_level: int,
             start_listening=False,
             checkpoint_path=checkpoint_path,
             start_tier=start_tier,
+            server_configuration=server_configuration,
         )
         return Monitor(SingleAgentWrapper(env, opponent))
     return _init
@@ -196,20 +217,40 @@ def _parse_opponent_mix(args: argparse.Namespace) -> list[str]:
     return [args.train_opponent] * args.n_envs
 
 
-def create_vec_env(args: argparse.Namespace) -> SubprocVecEnv:
+def create_vec_env(args: argparse.Namespace,
+                   worker_checkpoint_paths: list[str] | None = None) -> SubprocVecEnv:
     """Create a SubprocVecEnv with opponent blending. Each worker lazily
-    instantiates its own poke_env objects to avoid asyncio event loop issues."""
+    instantiates its own poke_env objects to avoid asyncio event loop issues.
+
+    If worker_checkpoint_paths is provided, each self_play/adaptive worker
+    gets its own checkpoint file (for pool-based PFSP training).
+    """
     opponents = _parse_opponent_mix(args)
     if len(opponents) != args.n_envs:
         raise ValueError(
             f"--train-opponents has {len(opponents)} entries but --n-envs is {args.n_envs}; they must match"
         )
-    return SubprocVecEnv([
-        _make_env_fn(opp, args.battle_format, args.log_level,
-                      checkpoint_path=getattr(args, "self_play_checkpoint", None),
-                      start_tier=getattr(args, "adaptive_start_tier", 0))
-        for opp in opponents
-    ])
+
+    default_cp = getattr(args, "self_play_checkpoint", None)
+    start_tier = getattr(args, "adaptive_start_tier", 0)
+    ports = [int(p) for p in args.server_ports.split(",")]
+    server_configs = [_make_server_config(p) for p in ports]
+
+    # Assign per-worker checkpoint paths for self-play/adaptive workers
+    sp_idx = 0
+    env_fns = []
+    for i, opp in enumerate(opponents):
+        sc = server_configs[i % len(server_configs)]
+        if worker_checkpoint_paths and opp in ("self_play", "adaptive"):
+            cp = worker_checkpoint_paths[sp_idx % len(worker_checkpoint_paths)]
+            sp_idx += 1
+        else:
+            cp = default_cp
+        env_fns.append(_make_env_fn(opp, args.battle_format, args.log_level,
+                                     checkpoint_path=cp, start_tier=start_tier,
+                                     server_configuration=sc))
+
+    return SubprocVecEnv(env_fns)
 
 
 def verify_obs(env: Monitor, obs: dict[str, Any], verify_embedding: bool) -> None:
@@ -311,6 +352,8 @@ class PokeEnvEvalCallback(BaseCallback):
         best_model_save_path: str,
         log_path: str,
         tracked_env: BrentsRLAgent | None = None,
+        pool: "CheckpointPool | None" = None,
+        worker_checkpoint_paths: list[str] | None = None,
         verbose: int = 1,
     ):
         super().__init__(verbose)
@@ -320,6 +363,8 @@ class PokeEnvEvalCallback(BaseCallback):
         self.best_model_save_path = best_model_save_path
         self.log_path = log_path
         self.tracked_env = tracked_env
+        self.pool = pool
+        self.worker_checkpoint_paths = worker_checkpoint_paths or []
         self.best_mean_reward = -np.inf
 
     def _on_step(self) -> bool:
@@ -410,13 +455,23 @@ class PokeEnvEvalCallback(BaseCallback):
             self.model.save(best_path)
             if self.verbose:
                 print(f"  New best model saved (reward={mean_reward:.3f})")
-            # Update self-play checkpoint so SelfPlayPlayer workers pick up new weights
-            sp_path = getattr(self.args, "self_play_checkpoint", None)
-            if sp_path:
+
+            # Add to checkpoint pool if active
+            if self.pool is not None:
+                self.pool.add(best_path + ".zip")
+            elif getattr(self.args, "self_play_checkpoint", None):
+                # Fallback: update single self-play checkpoint
                 import shutil
-                shutil.copy2(best_path + ".zip", sp_path)
+                shutil.copy2(best_path + ".zip", self.args.self_play_checkpoint)
                 if self.verbose:
-                    print(f"  Self-play checkpoint updated: {sp_path}")
+                    print(f"  Self-play checkpoint updated: {self.args.self_play_checkpoint}")
+
+        # Reassign pool opponents every eval cycle (not just on new best)
+        if self.pool is not None and self.worker_checkpoint_paths:
+            assignments = self.pool.assign_to_workers(self.worker_checkpoint_paths)
+            if self.verbose:
+                print(f"  [Pool] reassigned workers: {assignments}")
+                print(f"  {self.pool.summary()}")
 
         return True
 
@@ -461,9 +516,9 @@ def _validate_self_play_args(args: argparse.Namespace) -> None:
     else:
         all_opponents.append(args.train_opponent)
     all_opponents.append(args.eval_opponent)
-    if "self_play" in all_opponents and not args.self_play_checkpoint:
+    if "self_play" in all_opponents and not args.self_play_checkpoint and not args.resume_from:
         raise ValueError(
-            "--self-play-checkpoint is required when any opponent is 'self_play'"
+            "--self-play-checkpoint or --resume-from is required when any opponent is 'self_play'"
         )
 
 
@@ -482,10 +537,33 @@ def main() -> None:
 
     use_vec_env = args.n_envs > 1
     train_env: BrentsRLAgent | None = None
+    pool = None
+    worker_checkpoint_paths: list[str] = []
+
+    # Set up checkpoint pool for self-play if any opponent is self_play/adaptive
+    opponents_list = _parse_opponent_mix(args) if use_vec_env else [args.train_opponent]
+    has_self_play = any(o in ("self_play", "adaptive") for o in opponents_list)
+
+    if has_self_play and use_vec_env:
+        from checkpoint_pool import CheckpointPool
+        pool_dir = os.path.join(artifacts["run_dir"], "pool")
+        pool = CheckpointPool(pool_dir, max_size=args.pool_size)
+
+        # Count self-play workers
+        n_sp_workers = sum(1 for o in opponents_list if o in ("self_play", "adaptive"))
+        worker_checkpoint_paths = pool.setup_worker_paths(n_sp_workers)
+
+        # Seed pool with initial checkpoint
+        seed_path = args.self_play_checkpoint or args.resume_from
+        if seed_path and os.path.exists(seed_path):
+            pool.seed(seed_path)
+            # Initialize worker files from seed
+            pool.assign_to_workers(worker_checkpoint_paths)
+            print(f"Checkpoint pool initialized: {pool.summary()}")
 
     if use_vec_env:
         print(f"Creating SubprocVecEnv with {args.n_envs} workers...")
-        env = create_vec_env(args)
+        env = create_vec_env(args, worker_checkpoint_paths=worker_checkpoint_paths or None)
         # SubprocVecEnv doesn't expose inner envs; train reports unavailable
         train_env = None
     else:
@@ -506,9 +584,8 @@ def main() -> None:
                 name_prefix="rl_model",
             )
 
-            # Seed the self-play checkpoint path so weight refresh works
-            # from the start (opponent reloads from this path as training saves new bests)
-            if args.self_play_checkpoint:
+            # Seed the self-play checkpoint path (non-pool fallback)
+            if args.self_play_checkpoint and pool is None:
                 if not os.path.exists(args.self_play_checkpoint) and args.resume_from:
                     os.makedirs(os.path.dirname(args.self_play_checkpoint), exist_ok=True)
                     import shutil
@@ -522,6 +599,8 @@ def main() -> None:
                 best_model_save_path=os.path.join(artifacts["run_dir"], "best_model"),
                 log_path=artifacts["run_dir"],
                 tracked_env=train_env,
+                pool=pool,
+                worker_checkpoint_paths=worker_checkpoint_paths,
             )
 
             model.learn(

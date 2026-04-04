@@ -9,6 +9,10 @@ from poke_env.player.baselines import (
     SimpleHeuristicsPlayer,
 )
 from poke_env.ps_client import AccountConfiguration
+from poke_env.ps_client.server_configuration import (
+    LocalhostServerConfiguration,
+    ServerConfiguration,
+)
 
 OpponentName: TypeAlias = str
 OPPONENT_CHOICES: tuple[str, ...] = (
@@ -40,6 +44,7 @@ def create_opponent(
     start_listening: bool = False,
     checkpoint_path: str | None = None,
     start_tier: int = 0,
+    server_configuration: ServerConfiguration = LocalhostServerConfiguration,
 ) -> Player:
     if opponent_name == "self_play":
         if checkpoint_path is None:
@@ -81,4 +86,5 @@ def create_opponent(
         battle_format=battle_format,
         start_listening=start_listening,
         log_level=log_level,
+        server_configuration=server_configuration,
     )

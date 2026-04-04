@@ -22,6 +22,10 @@ CHECKPOINTS = [
     ("v8c_long", "results/ppo/v8c_long/model.zip"),
     ("v9_noatk_best", "results/ppo/v9_heuristic_noatk/best_model_66pct.zip"),
     ("v9_noatk_final", "results/ppo/v9_heuristic_noatk/model.zip"),
+    ("v9b_noatk_long", "results/ppo/v9b_noatk_long/best_model/best_model.zip"),
+    # Self-play
+    ("v10_pfsp", "results/ppo/v10_pfsp/best_model/best_model.zip"),
+    ("v10b_4v4", "results/ppo/v10b_4v4/best_model/best_model.zip"),
 ]
 
 OPPONENTS = "random,max_base_power,simple_heuristic"
