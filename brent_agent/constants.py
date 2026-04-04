@@ -36,7 +36,7 @@ REWARD_CONFIG = {
     "penalty_redundant_self_drop_move": -0.05,
     "penalty_unsafe_stay_in_with_fast_ko_switch": -0.2,
     "bonus_good_heal_timing": 0.2,
-    "bonus_good_attack_selection": 0.10,
+    "bonus_good_attack_selection": 0.0,
     "bonus_good_safe_switch": 0.2,
     "bonus_good_tera": 0.5,
     "penalty_abandon_boosted_mon": -0.05,

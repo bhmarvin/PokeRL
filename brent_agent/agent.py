@@ -92,6 +92,10 @@ class BrentsRLAgent(SinglesEnv):
         # Retrospective switch tracking: did we just switch?
         self._just_switched: bool = False
         self._switched_from_types: Optional[Tuple] = None
+        # Step-by-step replay logging (disabled by default)
+        self._replay_logging: bool = False
+        self._replay_log: list[Dict[str, Any]] = []
+        self._last_logged_action: str = ""
         self.observation_spaces = {
             agent: Box(
                 low=-1.0,
@@ -174,9 +178,42 @@ class BrentsRLAgent(SinglesEnv):
     def calc_reward(self, battle: AbstractBattle) -> float:
         base_config = {key: REWARD_CONFIG[key] for key in POKE_ENV_REWARD_KEYS}
         reward = self.reward_computing_helper(battle, **base_config)
+
+        # Capture shaping matches before consuming
+        shaping_details: list[Dict[str, Any]] = []
+        ctx = self._tactical_reward_context
+        if ctx is not None and ctx.battle_tag == _battle_tag(battle):
+            shaping_details = [
+                {"reason": m.reason, "reward": m.reward}
+                for m in ctx.matches if m.reward != 0.0
+            ]
+
         shaping = self._consume_tactical_shaping(battle)
         head_hunter = self._head_hunter_bonus(battle)
         predicted_switch = self._predicted_switch_bonus(battle)
+
+        if self._replay_logging and self._last_logged_action:
+            active = battle.active_pokemon
+            opp = battle.opponent_active_pokemon
+            self._replay_log.append({
+                "turn": battle.turn,
+                "active": getattr(active, "species", "?") if active else "?",
+                "active_hp": round(active.current_hp_fraction, 3) if active else 0,
+                "opponent": getattr(opp, "species", "?") if opp else "?",
+                "opponent_hp": round(opp.current_hp_fraction, 3) if opp else 0,
+                "action": self._last_logged_action,
+                "base_reward": round(reward, 3),
+                "shaping": round(shaping, 3),
+                "shaping_details": shaping_details,
+                "head_hunter": round(head_hunter, 3),
+                "predicted_switch": round(predicted_switch, 3),
+                "total": round(reward + shaping + head_hunter + predicted_switch, 3),
+                "cumulative": round(
+                    sum(s["total"] for s in self._replay_log) + reward + shaping + head_hunter + predicted_switch, 3
+                ),
+            })
+            self._last_logged_action = ""  # consume to prevent double-logging
+
         return reward + shaping + head_hunter + predicted_switch
 
     def _predicted_switch_bonus(self, battle: AbstractBattle) -> float:
@@ -286,6 +323,14 @@ class BrentsRLAgent(SinglesEnv):
         if active is not None:
             self._switched_from_types = _effective_types(active)
         order = super().action_to_order(action, battle, fake=fake, strict=False)
+        # Log the action for replay
+        act = getattr(order, "order", None)
+        if isinstance(act, Move):
+            self._last_logged_action = f"move: {act.id}"
+        elif isinstance(act, Pokemon):
+            self._last_logged_action = f"switch: {act.species}"
+        else:
+            self._last_logged_action = str(order)
         self._record_action_choice(order)
         self._remember_tactical_reward_context(battle, order)
         return order
@@ -1677,6 +1722,16 @@ class BrentsRLAgent(SinglesEnv):
             "counts": dict(sorted(self._decision_audit_counts.items())),
             "samples": {category: list(samples) for category, samples in sorted(self._decision_audit_samples.items())},
         }
+
+    def enable_replay_logging(self) -> None:
+        self._replay_logging = True
+        self._replay_log = []
+
+    def disable_replay_logging(self) -> None:
+        self._replay_logging = False
+
+    def get_replay_log(self) -> list[Dict[str, Any]]:
+        return list(self._replay_log)
 
     def embed_battle(self, battle: AbstractBattle) -> np.ndarray:
         return self.vector_builder.embed_battle(battle)

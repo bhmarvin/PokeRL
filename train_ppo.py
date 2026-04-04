@@ -410,6 +410,13 @@ class PokeEnvEvalCallback(BaseCallback):
             self.model.save(best_path)
             if self.verbose:
                 print(f"  New best model saved (reward={mean_reward:.3f})")
+            # Update self-play checkpoint so SelfPlayPlayer workers pick up new weights
+            sp_path = getattr(self.args, "self_play_checkpoint", None)
+            if sp_path:
+                import shutil
+                shutil.copy2(best_path + ".zip", sp_path)
+                if self.verbose:
+                    print(f"  Self-play checkpoint updated: {sp_path}")
 
         return True
 

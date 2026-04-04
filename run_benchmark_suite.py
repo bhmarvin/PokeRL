@@ -14,15 +14,14 @@ import time
 PYTHON = os.path.join("venv", "Scripts", "python.exe")
 
 CHECKPOINTS = [
-    # v5 milestones
-    ("v5_stage3_heuristic", "results/ppo/v5_stage3_heuristic/best_model/best_model.zip"),
-    ("v5b_stage3_heuristic", "results/ppo/v5b_stage3_heuristic/best_model/best_model.zip"),
-    ("v5_selfplay", "results/ppo/v5_selfplay/best_model/best_model.zip"),
-    ("v5b_selfplay", "results/ppo/v5b_selfplay/best_model/best_model.zip"),
-    # v6 final
-    ("v6_stage4_heur_long", "results/ppo/v6_stage4_heuristic_long/best_model/best_model.zip"),
-    # v7
-    ("v7_adaptive", "results/ppo/v7_adaptive/best_model/best_model.zip"),
+    # Baselines
+    ("v6_stage4", "results/ppo/v6_stage4_heuristic_long/best_model/best_model.zip"),
+    # v7-v9 progression
+    ("v7_highent", "results/ppo/v7_heuristic_highent/model.zip"),
+    ("v8_lowlr", "results/ppo/v8_lowlr/model.zip"),
+    ("v8c_long", "results/ppo/v8c_long/model.zip"),
+    ("v9_noatk_best", "results/ppo/v9_heuristic_noatk/best_model_66pct.zip"),
+    ("v9_noatk_final", "results/ppo/v9_heuristic_noatk/model.zip"),
 ]
 
 OPPONENTS = "random,max_base_power,simple_heuristic"

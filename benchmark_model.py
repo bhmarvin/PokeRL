@@ -29,6 +29,9 @@ OPPONENT_ALIASES = {
     "simple_heuristic": "simple_heuristic",
     "simple": "simple_heuristic",
     "heuristic": "simple_heuristic",
+    "self_play": "self_play",
+    "selfplay": "self_play",
+    "adaptive": "adaptive",
 }
 
 
@@ -129,6 +132,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verify-embedding", action="store_true")
     parser.add_argument("--output-dir", default="results/benchmarks")
     parser.add_argument("--run-name")
+    parser.add_argument("--opponent-checkpoint",
+                        help="Path to checkpoint for self_play opponent")
     return parser.parse_args()
 
 
@@ -169,6 +174,7 @@ def create_env(args: argparse.Namespace, opponent_name: str) -> Monitor:
         battle_format=args.battle_format,
         log_level=args.log_level,
         start_listening=False,
+        checkpoint_path=getattr(args, "opponent_checkpoint", None),
     )
     return Monitor(SingleAgentWrapper(env, opponent))
 
