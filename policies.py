@@ -135,7 +135,7 @@ class MaskedActorCriticPolicy(ActorCriticPolicy):
         super().__init__(
             *args,
             **kwargs,
-            net_arch=dict(pi=[256, 128], vf=[256, 128]),
+            net_arch=dict(pi=[512, 256, 128], vf=[512, 256, 128]),
             features_extractor_class=StructuredObservationExtractor,
         )
         self._mask: th.Tensor | None = None

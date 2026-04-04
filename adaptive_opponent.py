@@ -24,7 +24,7 @@ TIER_NAMES = ("RandomPlayer", "MaxBasePowerPlayer", "SimpleHeuristicsPlayer", "S
 
 PROMOTE_THRESHOLD = 0.70
 DEMOTE_THRESHOLD = 0.30
-DEFAULT_WINDOW = 20
+DEFAULT_WINDOW = 50
 
 
 class AdaptivePlayer(Player):

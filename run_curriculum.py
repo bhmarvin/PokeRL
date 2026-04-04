@@ -21,7 +21,7 @@ PYTHON = os.path.join("venv", "Scripts", "python.exe")
 STAGES = [
     {
         "name": "stage1_random",
-        "timesteps": 200_000,
+        "timesteps": 300_000,
         "opponents": "random,random,random,random",
         "n_envs": 4,
         "eval_opponent": "random",
@@ -31,7 +31,7 @@ STAGES = [
     },
     {
         "name": "stage2_maxpower",
-        "timesteps": 400_000,
+        "timesteps": 500_000,
         "opponents": "max_base_power,max_base_power,max_base_power,max_base_power",
         "n_envs": 4,
         "eval_opponent": "max_base_power",
@@ -41,7 +41,7 @@ STAGES = [
     },
     {
         "name": "stage3_heuristic",
-        "timesteps": 600_000,
+        "timesteps": 800_000,
         "opponents": "simple_heuristic,simple_heuristic,simple_heuristic,simple_heuristic,simple_heuristic,simple_heuristic,max_base_power,max_base_power",
         "n_envs": 8,
         "eval_opponent": "simple_heuristic",
@@ -51,13 +51,13 @@ STAGES = [
     },
     {
         "name": "stage4_heuristic_long",
-        "timesteps": 800_000,
+        "timesteps": 1_500_000,
         "opponents": "simple_heuristic,simple_heuristic,simple_heuristic,simple_heuristic,simple_heuristic,simple_heuristic,simple_heuristic,simple_heuristic",
         "n_envs": 8,
         "eval_opponent": "simple_heuristic",
         "eval_battles": 100,
         "eval_freq": 20_000,
-        "lr": 3e-5,
+        "lr": 2e-5,
     },
 ]
 
