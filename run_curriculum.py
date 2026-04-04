@@ -21,42 +21,42 @@ PYTHON = os.path.join("venv", "Scripts", "python.exe")
 STAGES = [
     {
         "name": "stage1_random",
-        "timesteps": 300_000,
+        "timesteps": 800_000,
         "opponents": "random,random,random,random",
         "n_envs": 4,
         "eval_opponent": "random",
         "eval_battles": 100,
-        "eval_freq": 20_000,
+        "eval_freq": 50_000,
         "lr": 3e-4,
     },
     {
         "name": "stage2_maxpower",
-        "timesteps": 500_000,
+        "timesteps": 1_500_000,
         "opponents": "max_base_power,max_base_power,max_base_power,max_base_power",
         "n_envs": 4,
         "eval_opponent": "max_base_power",
         "eval_battles": 100,
-        "eval_freq": 20_000,
+        "eval_freq": 50_000,
         "lr": 1e-4,
     },
     {
         "name": "stage3_heuristic",
-        "timesteps": 800_000,
+        "timesteps": 2_000_000,
         "opponents": "simple_heuristic,simple_heuristic,simple_heuristic,simple_heuristic,simple_heuristic,simple_heuristic,max_base_power,max_base_power",
         "n_envs": 8,
         "eval_opponent": "simple_heuristic",
         "eval_battles": 100,
-        "eval_freq": 20_000,
+        "eval_freq": 50_000,
         "lr": 5e-5,
     },
     {
         "name": "stage4_heuristic_long",
-        "timesteps": 1_500_000,
+        "timesteps": 4_000_000,
         "opponents": "simple_heuristic,simple_heuristic,simple_heuristic,simple_heuristic,simple_heuristic,simple_heuristic,simple_heuristic,simple_heuristic",
         "n_envs": 8,
         "eval_opponent": "simple_heuristic",
         "eval_battles": 100,
-        "eval_freq": 20_000,
+        "eval_freq": 50_000,
         "lr": 2e-5,
     },
 ]
@@ -74,6 +74,10 @@ def parse_args() -> argparse.Namespace:
                         help="Entropy coefficient (passed to all stages)")
     parser.add_argument("--adaptive-start-tier", type=int, default=0,
                         help="Starting tier for adaptive opponents (passed to all stages)")
+    parser.add_argument("--server-ports", default="8000",
+                        help="Comma-separated Showdown server ports (passed to all stages)")
+    parser.add_argument("--use-lstm", action="store_true",
+                        help="Use RecurrentPPO with LSTM policy")
     return parser.parse_args()
 
 
@@ -95,6 +99,8 @@ def run_stage(
     stage_num: int,
     ent_coef: float = 0.02,
     adaptive_start_tier: int = 0,
+    server_ports: str = "8000",
+    use_lstm: bool = False,
 ) -> str | None:
     """Run one training stage. Returns path to best checkpoint, or None on failure."""
     run_name = f"{prefix}_{stage['name']}"
@@ -122,11 +128,14 @@ def run_stage(
         "--learning-rate", str(stage["lr"]),
         "--ent-coef", str(ent_coef),
         "--adaptive-start-tier", str(adaptive_start_tier),
+        "--server-ports", server_ports,
         "--run-name", run_name,
         "--output-dir", output_dir,
     ]
     if resume_from:
         cmd.extend(["--resume-from", resume_from])
+    if use_lstm:
+        cmd.append("--use-lstm")
 
     start = time.perf_counter()
     result = subprocess.run(cmd, cwd=os.path.dirname(os.path.abspath(__file__)))
@@ -181,6 +190,8 @@ def main() -> None:
             stage_num=i,
             ent_coef=args.ent_coef,
             adaptive_start_tier=args.adaptive_start_tier,
+            server_ports=args.server_ports,
+            use_lstm=args.use_lstm,
         )
 
         if checkpoint is None:

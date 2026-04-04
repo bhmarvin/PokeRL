@@ -165,3 +165,50 @@ class MaskedActorCriticPolicy(ActorCriticPolicy):
             th.finfo(action_logits.dtype).min,
         )
         return self.action_dist.proba_distribution(masked_logits)
+
+
+try:
+    from sb3_contrib.common.recurrent.policies import RecurrentActorCriticPolicy
+
+    class MaskedRecurrentActorCriticPolicy(RecurrentActorCriticPolicy):
+        def __init__(self, *args: Any, **kwargs: Any):
+            super().__init__(
+                *args,
+                **kwargs,
+                net_arch=dict(pi=[512, 256, 128], vf=[512, 256, 128]),
+                features_extractor_class=StructuredObservationExtractor,
+                lstm_hidden_size=256,
+                n_lstm_layers=1,
+                shared_lstm=False,
+                enable_critic_lstm=True,
+            )
+            self._mask: th.Tensor | None = None
+
+        def _set_action_mask(self, obs: dict[str, th.Tensor]) -> None:
+            self._mask = obs["action_mask"]
+
+        def forward(self, obs, lstm_states, episode_starts, deterministic=False):
+            self._set_action_mask(obs)
+            return super().forward(obs, lstm_states, episode_starts, deterministic)
+
+        def evaluate_actions(self, obs, actions, lstm_states, episode_starts):
+            self._set_action_mask(obs)
+            return super().evaluate_actions(obs, actions, lstm_states, episode_starts)
+
+        def get_distribution(self, obs, lstm_states, episode_starts):
+            self._set_action_mask(obs)
+            return super().get_distribution(obs, lstm_states, episode_starts)
+
+        def _get_action_dist_from_latent(self, latent_pi: th.Tensor):
+            action_logits = self.action_net(latent_pi)
+            if self._mask is None:
+                raise RuntimeError("Action mask not set before distribution construction.")
+            legal_mask = self._mask.to(dtype=th.bool)
+            masked_logits = action_logits.masked_fill(
+                ~legal_mask,
+                th.finfo(action_logits.dtype).min,
+            )
+            return self.action_dist.proba_distribution(masked_logits)
+
+except ImportError:
+    MaskedRecurrentActorCriticPolicy = None  # sb3-contrib not installed

@@ -157,6 +157,8 @@ def parse_args() -> argparse.Namespace:
                         help="Max checkpoint pool size for PFSP self-play (default 6)")
     parser.add_argument("--server-ports", default="8000",
                         help="Comma-separated ports for Showdown servers (workers distributed round-robin)")
+    parser.add_argument("--use-lstm", action="store_true",
+                        help="Use RecurrentPPO with LSTM policy instead of standard PPO")
     return parser.parse_args()
 
 
@@ -479,12 +481,23 @@ class PokeEnvEvalCallback(BaseCallback):
 def build_model(args: argparse.Namespace, env: Monitor, run_name: str = "") -> PPO:
     tb_log_dir = os.path.join(args.output_dir, "logs", run_name) if run_name else os.path.join(args.output_dir, "logs")
 
+    use_lstm = getattr(args, "use_lstm", False)
+    if use_lstm:
+        from sb3_contrib import RecurrentPPO
+        from policies import MaskedRecurrentActorCriticPolicy
+        algo_cls = RecurrentPPO
+        policy_cls = MaskedRecurrentActorCriticPolicy
+        print("Using RecurrentPPO with LSTM policy")
+    else:
+        algo_cls = PPO
+        policy_cls = MaskedActorCriticPolicy
+
     if args.resume_from:
-        print(f"Loading PPO checkpoint from {args.resume_from}")
-        model = PPO.load(
+        print(f"Loading checkpoint from {args.resume_from}")
+        model = algo_cls.load(
             args.resume_from, env=env, device=args.device,
             tensorboard_log=tb_log_dir,
-            custom_objects={"learning_rate": args.learning_rate, "ent_coef": args.ent_coef, "n_steps": 4096, "batch_size": 256},
+            custom_objects={"learning_rate": args.learning_rate, "ent_coef": args.ent_coef, "n_steps": 4096, "batch_size": 512},
         )
         print(f"  learning_rate overridden to {args.learning_rate}")
         print(f"  ent_coef overridden to {args.ent_coef}")
@@ -493,12 +506,12 @@ def build_model(args: argparse.Namespace, env: Monitor, run_name: str = "") -> P
     base_lr = args.learning_rate
     lr_schedule = lambda progress: base_lr * (1.0 - 0.9 * progress)
 
-    return PPO(
-        MaskedActorCriticPolicy,
+    return algo_cls(
+        policy_cls,
         env,
         learning_rate=lr_schedule,
         n_steps=4096,
-        batch_size=256,
+        batch_size=512,
         gamma=0.99,
         ent_coef=args.ent_coef,
         device=args.device,
