@@ -30,13 +30,33 @@ Numbers that came from measuring are marked as such.
 | Search | Stage A: one-turn payoff matrix over sampled worlds solved for a mixed strategy (mikumiku37). Stage B: depth-limited decoupled pUCT (Jaxcalibur) | Stage A is a few hundred lines on top of a batched `step`. Stage B needs the tree machinery |
 | Deployment | poke_env stays as the Showdown client. A thin adapter maps poke_env's battle object to the engine's observation and, for search, to sampled engine states | Your ladder plumbing, replay viewer, Elo and benchmark tooling all survive |
 
+### 0.1 Hardware budget on a 3080 Ti
+
+| Quantity | 4090/5090 assumption | 3080 Ti target | Why |
+|---|---|---|---|
+| Parallel battles | 4096 | 4096 | Engine state is a few MB; not memory-bound |
+| Model | d_model 256, 6 layers, ~8M params | d_model 192, 4 layers, ~3M params to start; scale up only if Elo plateaus | Inference during rollouts is the real cost: 2 players x 59 tokens per step. Halving the trunk roughly doubles games/s |
+| PPO minibatch | 8192 | 4096 (bf16 activations) | Activation memory for 59-token attention with backward; 4096 fits in about 4 GB |
+| Engine-only throughput | > 100k steps/s | > 50k steps/s | Memory bandwidth 912 GB/s vs 1 TB/s+, fewer SMs |
+| End-to-end games/s (engine + both policies) | ~2,000 | 150 to 300 | Model forward dominates once the engine is fast |
+| Games per 24 h | ~170M | 13M to 26M | |
+| Time to Jaxcalibur's 100M games | about half a day of engine time | 4 to 8 days of training | Still well inside one GPU; runs are a week, not a weekend |
+
+The consequences: the small-model default is now the baseline rather than a
+fallback; training runs are planned as week-long jobs with checkpoint resume
+(Orbax) so a reboot costs nothing; the Node oracle and all data tooling run
+on CPU and never contend for the GPU; search Stage A at 4,096 engine steps
+and value evaluations per decision is still well under a second.
+
 ### What I need from you before Phase 2
 
-1. **GPU and OS.** Your scripts use `venv\Scripts\python.exe`, so you are on
-   Windows. JAX has no native CUDA build for Windows. GPU JAX runs on Linux or
-   on Windows through WSL2 with the CUDA driver. If you are on Windows, the
-   plan assumes WSL2 (Ubuntu) with `pip install "jax[cuda12]"`. Confirm which
-   GPU you have. Throughput targets below assume a 4090/5090-class card.
+1. **GPU and OS.** GPU confirmed: RTX 3080 Ti (12 GB, Ampere, bf16 tensor
+   cores, about 40% of a 4090 in sustained throughput). Everything in this
+   plan fits in 12 GB; see Section 0.1 for the rescaled targets. Your scripts
+   use `venv\Scripts\python.exe`, so you are on Windows. JAX has no native
+   CUDA build for Windows. GPU JAX runs on Linux or on Windows through WSL2
+   with the CUDA driver (the 3080 Ti is supported). The plan assumes WSL2
+   (Ubuntu) with `pip install "jax[cuda12]"`. Confirm WSL2 is acceptable.
 2. **Time budget.** The milestone schedule assumes roughly 10 focused hours a
    week from you plus my transcription and scaffolding between sessions. Tell
    me if that is wrong and I will rescale.
@@ -610,9 +630,11 @@ as `brent_agent` does today.
 
 ### 9.2 Architecture
 
-Non-causal encoder: 59 tokens, d_model 256, 8 heads, 6 layers, per-token-type
-MLP weights, pre-LN, GELU. That is about 5M params in the trunk; with
-embeddings and heads about 8M, in line with both references. Heads from a
+Non-causal encoder: 59 tokens, per-token-type MLP weights, pre-LN, GELU.
+Baseline on the 3080 Ti: d_model 192, 6 heads, 4 layers, about 2M in the
+trunk and 3M with embeddings and heads. Scale-up config, only if Elo
+plateaus: d_model 256, 8 heads, 6 layers, about 8M total, which is the size
+both references used. Heads from a
 pooled (CLS) token plus the own-move and own-team tokens:
 
 - **policy**: 15 logits, masked with the legal mask before softmax.
@@ -669,7 +691,7 @@ policy with temperature 1 so it is not deterministic.
 
 | Param | Start | Notes |
 |---|---|---|
-| Battles in parallel | 4096 | fit to GPU memory |
+| Battles in parallel | 4096 | fits in 12 GB with the small model |
 | Rollout length | 32 steps | ~ one game is 25 to 60 decisions, so partial episodes with bootstrapping |
 | Gamma | 1.0 | terminal reward, episodic |
 | GAE lambda | 0.95 | |
@@ -678,12 +700,13 @@ policy with temperature 1 so it is not deterministic.
 | Entropy | 0.01 decaying to 0.001 | |
 | Value coef | 0.5 | |
 | Aux coefs | next-action 0.3, opp-set 0.1 | tune on validation |
-| Epochs / minibatch | 4 / 8192 | |
+| Epochs / minibatch | 4 / 4096 | 8192 on a 24 GB card |
 
-Throughput math to set expectations: at 2,000 games/s the engine alone does
-about 170M games a day. mikumiku37's #1 checkpoint saw 330M. Jaxcalibur's
-saw 100M. Training will be the bottleneck, not the env, which is the right
-place to be.
+Throughput math to set expectations on the 3080 Ti: 150 to 300 games/s end
+to end is 13M to 26M games a day, so Jaxcalibur's 100M games is a 4 to 8 day
+run and mikumiku37's 330M is two to three weeks. Both are feasible as
+resumable background jobs. The policy forward pass, not the engine, will be
+the bottleneck, which is the right place to be.
 
 Exit criteria: a 24-hour run on your GPU that shows monotone internal Elo,
 beats `SimpleHeuristicsPlayer` above 95% through the poke_env adapter, and
@@ -752,8 +775,8 @@ small interface change.
 
 ## 14. Timeline and milestones
 
-Assumes WSL2 or Linux with a 4090/5090-class GPU and about 10 hours a week
-from you. Weeks are calendar weeks.
+Assumes WSL2 with the 3080 Ti and about 10 hours a week from you. Training
+milestones (M6, M8) are week-long background runs on this card. Weeks are calendar weeks.
 
 | Milestone | Week | Exit criterion |
 |---|---|---|
@@ -783,7 +806,7 @@ nothing in the plan depends on finishing fast.
 | The bot learns engine bugs | Coverage status only reaches `verified` through fuzz; distributional parity at every milestone; ladder games are replayed through the adapter and diffed |
 | Showdown randbats sets drift | Pinned commit; a documented regen procedure; a ladder-time check that the opponent's revealed set exists in our bank |
 | jit compile times explode as handlers grow | Table-driven handlers, not `lax.switch` chains; measure compile time per batch |
-| Transformer throughput below target | d_model 192 / 4 layers fallback; both references are "small" models for a reason |
+| Transformer throughput below target on the 3080 Ti | Small model is the baseline; drop history tokens to 8 and matchup tokens to 12 before dropping layers; bf16 everywhere except losses |
 
 ---
 
