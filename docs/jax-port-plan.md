@@ -48,22 +48,23 @@ fallback; training runs are planned as week-long jobs with checkpoint resume
 on CPU and never contend for the GPU; search Stage A at 4,096 engine steps
 and value evaluations per decision is still well under a second.
 
-### What I need from you before Phase 2
+### 0.2 Assumptions, final
 
-1. **GPU and OS.** GPU confirmed: RTX 3080 Ti (12 GB, Ampere, bf16 tensor
-   cores, about 40% of a 4090 in sustained throughput). Everything in this
-   plan fits in 12 GB; see Section 0.1 for the rescaled targets. Your scripts
-   use `venv\Scripts\python.exe`, so you are on Windows. JAX has no native
-   CUDA build for Windows. GPU JAX runs on Linux or on Windows through WSL2
-   with the CUDA driver (the 3080 Ti is supported). The plan assumes WSL2
-   (Ubuntu) with `pip install "jax[cuda12]"`. Confirm WSL2 is acceptable.
-2. **Time budget.** The milestone schedule assumes roughly 10 focused hours a
-   week from you plus my transcription and scaffolding between sessions. Tell
-   me if that is wrong and I will rescale.
-3. **Showdown version pin.** We pin one commit of `smogon/pokemon-showdown` for
-   the whole project and regenerate the team bank and data tables only when we
-   deliberately bump it. Randbats sets change monthly. I propose pinning the
-   commit at the time Phase 0 lands.
+1. **Hardware and OS.** RTX 3080 Ti, 12 GB, on Windows through WSL2 (Ubuntu
+   22.04 or later, NVIDIA driver 535+, `pip install "jax[cuda12]"`). All
+   scripts, paths and shell snippets in this plan are POSIX. The existing
+   `venv\Scripts` workflow stays for the legacy poke_env code only.
+2. **Time.** Training runs are unattended, resumable, week-long background
+   jobs; GPU time is not the constraint. Human time is asynchronous: I land
+   batches as PRs with tests and a coverage diff, you review and run the
+   GPU regressions when convenient. The milestone weeks in Section 14 are
+   ordering and sizing guides, not deadlines.
+3. **Showdown pin.** The commit of `smogon/pokemon-showdown` checked out when
+   Phase 0 lands is the pin for the whole project, recorded in
+   `pokejax/data/SHOWDOWN_COMMIT`. The team bank, tables and inventory are
+   regenerated only on a deliberate bump, which is its own PR.
+4. **Branch.** All work lands on `claude/youthful-ptolemy-3ozvbk` until Phase 2
+   is reviewed, then merges to `main` and continues there in normal PRs.
 
 ---
 
@@ -810,19 +811,31 @@ nothing in the plan depends on finishing fast.
 
 ---
 
-## 16. First concrete actions
+## 16. Kickoff order
 
-1. You: confirm GPU, OS (WSL2?), and weekly hours. Install
-   `jax[cuda12]`, `flax`, `optax`, `chex`, `jaxtyping`, `orbax-checkpoint`,
-   Node 20, and clone Showdown at a pinned commit. Run
+1. **Me, now:** Phase 0 in full as one PR. Showdown pinned under
+   `third_party/pokemon-showdown`, `export_showdown.mjs`, `build_tables.py`,
+   `build_team_bank.mjs` + `pack_team_bank.py`, `showdown_worker.mjs`,
+   `canon.py`, `fuzz.py`, `tests/test_oracle.py`. CPU only, so it does not
+   wait on your WSL2 setup.
+2. **You, when convenient:** WSL2 + CUDA JAX install, verified by
+   `python -c "import jax; print(jax.devices())"` showing the 3080 Ti. Then
    `python tools/mechanics_inventory.py third_party/pokemon-showdown` and
-   commit the resulting `docs/mechanics_inventory.json`.
-2. Me: Phase 0 in full (export script, table packer, team bank generator and
-   packer, oracle worker, canonicalizer, fuzz driver), as one PR with its own
-   tests, so M0 is done by the time you have the environment up.
-3. Together: Phase 1, the damage calc port, as the JAX on-ramp. I scaffold
-   `engine/damage.py` with the first few modifiers and the parity test; you
-   port the next modifiers from your own `_manual_damage_calc` and watch the
-   test go green.
-4. Me: Phase 2 design doc for state, passes and the three fixed-shape
-   breakers, for your review before any effect is transcribed.
+   commit `docs/mechanics_inventory.json`.
+3. **Me, next:** Phase 1 scaffold (`engine/damage.py` with the base formula,
+   STAB, type effectiveness, crit, roll, and the parity test harness wired to
+   both `brent_agent` and `@smogon/calc` through the oracle worker).
+4. **You:** port the remaining damage modifiers from your own
+   `_manual_damage_calc` into `damage.py`, one modifier per commit, watching
+   the parity test. This is the JAX on-ramp and it is deliberately yours.
+5. **Me:** Phase 2 design PR: `state.py`, `legal.py`, `turn.py` with the pass
+   skeleton, `prng.py` with stub and gen5 modes, the three fixed-shape design
+   notes (Illusion, Trace/copy, formes), and the data-only subset running
+   end to end under `jit` and `vmap`. You review the state layout before any
+   effect is transcribed.
+6. **Both, repeating:** Phase 3 batches in the Section 7.4 order, one PR each,
+   `coverage.yaml` as the scoreboard, until the bank is 95% covered.
+7. **Me, in parallel from Phase 2:** Phase 5 model and Phase 6 loop, dry-run on
+   the data-only subset so the training stack is proven before coverage is.
+8. **You:** the first week-long run at 95% coverage (M6), then the ladder run
+   with Stage A search (M8).
